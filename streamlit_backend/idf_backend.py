@@ -60,14 +60,13 @@ def get_open_meteo_config() -> dict[str, Any]:
     api_key = (os.getenv("OPEN_METEO_API_KEY") or "").strip()
     customer_base = (os.getenv("OPEN_METEO_CUSTOMER_BASE") or OPEN_METEO_CUSTOMER_BASE).rstrip("/")
     use_customer_api = bool(api_key)
-    archive_url = f"{customer_base}/v1/archive" if use_customer_api else OPEN_METEO_ARCHIVE
-    geocoding_url = f"{customer_base}/v1/search" if use_customer_api else OPEN_METEO_GEOCODING
     return {
         "api_key": api_key,
         "use_customer_api": use_customer_api,
-        "archive_url": archive_url,
-        "geocoding_url": geocoding_url,
-        "archive_host": customer_base if use_customer_api else "free",
+        "archive_url": OPEN_METEO_ARCHIVE,
+        "geocoding_url": OPEN_METEO_GEOCODING,
+        "forecast_url": f"{customer_base}/v1/forecast" if use_customer_api else "https://api.open-meteo.com/v1/forecast",
+        "archive_host": "archive-api.open-meteo.com" if use_customer_api else "free",
     }
 
 
@@ -172,7 +171,7 @@ def _search_open_meteo(query: str) -> dict[str, Any] | None:
     status, payload = _session_get_json(
         config["geocoding_url"],
         {"name": query, "count": 1, "language": "tr", "format": "json"},
-        include_api_key=config["use_customer_api"],
+        include_api_key=False,
     )
     results = payload.get("results", []) if isinstance(payload, dict) else []
     if status != 200 or not results:
