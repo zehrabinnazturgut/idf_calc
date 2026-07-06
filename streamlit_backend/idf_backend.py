@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +15,10 @@ DISTRIBUTIONS = {
     "lp3": "Log Pearson III",
     "gumbel": "Gumbel",
     "gev": "GEV",
+}
+SERIES_METHODS = {
+    "ams": "Annual Maximum Series",
+    "pds": "Partial Duration Series",
 }
 RUNOFF_VARIABLES = [
     "precipitation",
@@ -29,6 +34,10 @@ DURATIONS = [1, 2, 3, 6, 12, 24]
 RETURN_PERIODS = [2, 5, 10, 25, 50, 100]
 ARCHIVE_CHUNK_YEARS = 12
 DEFAULT_END_YEAR = 2025
+DEFAULT_PDS_PERCENTILE = 99.5
+DEFAULT_PDS_GAP_HOURS = 72
+DEFAULT_BOOTSTRAP_SAMPLES = 200
+CONFIDENCE_LEVEL = 0.90
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_GEOCODING = "https://geocoding-api.open-meteo.com/v1/search"
 OPEN_METEO_CUSTOMER_BASE = "https://customer-api.open-meteo.com"
@@ -184,6 +193,10 @@ def calculate_analysis(
     start_year: int,
     end_year: int,
     distribution: str,
+    series_method: str = "ams",
+    pds_percentile: float = DEFAULT_PDS_PERCENTILE,
+    pds_gap_hours: int = DEFAULT_PDS_GAP_HOURS,
+    bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> dict[str, Any]:
     query_key = {
@@ -192,6 +205,10 @@ def calculate_analysis(
         "start_year": int(start_year),
         "end_year": int(end_year),
         "distribution": distribution,
+        "series_method": series_method,
+        "pds_percentile": round(float(pds_percentile), 3),
+        "pds_gap_hours": int(pds_gap_hours),
+        "bootstrap_samples": int(bootstrap_samples),
         "variables": RUNOFF_VARIABLES,
         "chunk_years": ARCHIVE_CHUNK_YEARS,
         "commercial_api": get_open_meteo_config()["use_customer_api"],
@@ -203,7 +220,18 @@ def calculate_analysis(
         return cached
 
     series = fetch_archive_by_year(location, start_year, end_year, progress_callback)
-    result = build_analysis(series, location, distribution, start_year, end_year)
+    result = build_analysis(
+        yearly_series=series,
+        location=location,
+        distribution=distribution,
+        start_year=start_year,
+        end_year=end_year,
+        series_method=series_method,
+        pds_percentile=pds_percentile,
+        pds_gap_hours=pds_gap_hours,
+        bootstrap_samples=bootstrap_samples,
+        progress_callback=progress_callback,
+    )
     _cache_write("analysis", query_key, result)
     return result
 
@@ -302,27 +330,59 @@ def build_analysis(
     distribution: str,
     start_year: int,
     end_year: int,
+    series_method: str = "ams",
+    pds_percentile: float = DEFAULT_PDS_PERCENTILE,
+    pds_gap_hours: int = DEFAULT_PDS_GAP_HOURS,
+    bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
+    progress_callback: Callable[[str, float], None] | None = None,
 ) -> dict[str, Any]:
     durations = []
-    for duration in DURATIONS:
-        events = []
-        for series in yearly_series:
-            event = rolling_max_event(series["values"], duration)
-            if event["value"] is not None and event["value"] > 0:
-                events.append({"series": series, "event": event})
+    for duration_index, duration in enumerate(DURATIONS):
+        if progress_callback:
+            progress_callback(
+                f"{duration} saat icin frekans analizi",
+                0.96 + 0.04 * ((duration_index + 1) / max(len(DURATIONS), 1)),
+            )
+        events, extraction_meta = extract_duration_records(
+            yearly_series=yearly_series,
+            duration=duration,
+            series_method=series_method,
+            pds_percentile=pds_percentile,
+            pds_gap_hours=pds_gap_hours,
+        )
         maxima = [record["event"]["value"] for record in events]
-        if len(maxima) < 8:
-            raise RuntimeError(f"{duration} saat süresi için yeterli yıllık maksimum seri oluşmadı.")
-        depths = [estimate_quantile(maxima, period, distribution) for period in RETURN_PERIODS]
+        minimum_samples = 8 if series_method == "ams" else 12
+        if len(maxima) < minimum_samples:
+            raise RuntimeError(f"{duration} saat suresi icin yeterli bagimsiz olay olusmadi.")
+        fit_diagnostics = compare_distributions(maxima)
+        selected_fit = fit_diagnostics[distribution]
+        nonexceedance_probabilities = [
+            probability_for_return_period(return_period, extraction_meta["event_rate"], series_method)
+            for return_period in RETURN_PERIODS
+        ]
+        depths = [quantile_from_fit(selected_fit, probability) for probability in nonexceedance_probabilities]
+        lower_depths, upper_depths = bootstrap_confidence_intervals(
+            samples=maxima,
+            distribution=distribution,
+            probabilities=nonexceedance_probabilities,
+            bootstrap_samples=bootstrap_samples,
+        )
         durations.append(
             {
                 "duration": duration,
                 "maxima": maxima,
                 "depths": depths,
+                "depthLower": lower_depths,
+                "depthUpper": upper_depths,
                 "intensities": [depth / duration for depth in depths],
+                "intensityLower": [depth / duration for depth in lower_depths],
+                "intensityUpper": [depth / duration for depth in upper_depths],
                 "sampleMean": mean(maxima),
                 "sampleMax": max(maxima),
-                "parameterText": describe_fit(maxima, distribution),
+                "sampleSize": len(maxima),
+                "parameterText": selected_fit["parameterText"],
+                "fitDiagnostics": fit_diagnostics,
+                "seriesMeta": extraction_meta,
                 "runoffSummary": summarize_runoff_drivers(events, duration),
             }
         )
@@ -330,6 +390,11 @@ def build_analysis(
     return {
         "location": location,
         "distribution": distribution,
+        "seriesMethod": series_method,
+        "seriesMethodLabel": SERIES_METHODS.get(series_method, series_method),
+        "pdsPercentile": pds_percentile,
+        "pdsGapHours": pds_gap_hours,
+        "confidenceLevel": CONFIDENCE_LEVEL,
         "startYear": start_year,
         "endYear": end_year,
         "returnPeriods": RETURN_PERIODS,
@@ -337,8 +402,145 @@ def build_analysis(
         "totalHours": sum(series["hours"] for series in yearly_series),
         "missingHours": sum(series["missing"] for series in yearly_series),
         "yearsUsed": len(yearly_series),
+        "mgmCrosscheck": {
+            "status": "placeholder",
+            "message": "MGM saatlik veri baglantisi daha sonra eklenecek. Beklenen alanlar: zaman damgasi ve saatlik yagis.",
+        },
         "generatedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
+
+
+def extract_duration_records(
+    yearly_series: list[dict[str, Any]],
+    duration: int,
+    series_method: str,
+    pds_percentile: float,
+    pds_gap_hours: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    if series_method == "pds":
+        return extract_partial_duration_records(yearly_series, duration, pds_percentile, pds_gap_hours)
+    records = []
+    years_with_event = 0
+    for series in yearly_series:
+        event = rolling_max_event(series["values"], duration)
+        if event["value"] is None or event["value"] <= 0:
+            continue
+        years_with_event += 1
+        records.append({"series": series, "event": event, "year": series["year"]})
+    event_rate = len(records) / max(len(yearly_series), 1)
+    return records, {
+        "method": "ams",
+        "threshold": None,
+        "independentGapHours": duration,
+        "eventRate": event_rate,
+        "event_rate": event_rate,
+        "eventsPerYear": event_rate,
+        "yearsWithEvents": years_with_event,
+        "totalEvents": len(records),
+    }
+
+
+def extract_partial_duration_records(
+    yearly_series: list[dict[str, Any]],
+    duration: int,
+    percentile: float,
+    gap_hours: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    candidate_records = []
+    candidate_values = []
+    for series in yearly_series:
+        for event in rolling_window_events(series["values"], duration):
+            if event["value"] is None or event["value"] <= 0:
+                continue
+            record = {"series": series, "event": event, "year": series["year"]}
+            candidate_records.append(record)
+            candidate_values.append(event["value"])
+    if not candidate_values:
+        return [], {
+            "method": "pds",
+            "threshold": None,
+            "independentGapHours": max(duration, gap_hours),
+            "eventRate": 0.0,
+            "event_rate": 0.0,
+            "eventsPerYear": 0.0,
+            "yearsWithEvents": 0,
+            "totalEvents": 0,
+        }
+    threshold = percentile_value(candidate_values, percentile)
+    separation = max(duration, gap_hours)
+    filtered = [record for record in candidate_records if record["event"]["value"] >= threshold]
+    filtered.sort(key=lambda item: item["event"]["value"], reverse=True)
+    selected = []
+    occupied: dict[int, list[tuple[int, int]]] = {}
+    for record in filtered:
+        year = int(record["year"])
+        end_index = int(record["event"]["endIndex"])
+        start_index = end_index - duration + 1
+        blocked = False
+        for existing_start, existing_end in occupied.get(year, []):
+            if start_index <= existing_end + separation and end_index >= existing_start - separation:
+                blocked = True
+                break
+        if blocked:
+            continue
+        occupied.setdefault(year, []).append((start_index, end_index))
+        selected.append(record)
+    selected.sort(key=lambda item: (int(item["year"]), int(item["event"]["endIndex"])))
+    years_with_event = len({record["year"] for record in selected})
+    event_rate = len(selected) / max(len(yearly_series), 1)
+    return selected, {
+        "method": "pds",
+        "threshold": threshold,
+        "thresholdPercentile": percentile,
+        "independentGapHours": separation,
+        "eventRate": event_rate,
+        "event_rate": event_rate,
+        "eventsPerYear": event_rate,
+        "yearsWithEvents": years_with_event,
+        "totalEvents": len(selected),
+    }
+
+
+def rolling_window_events(values: list[Any], duration: int) -> list[dict[str, Any]]:
+    events = []
+    total = 0.0
+    missing = 0
+    for index, raw in enumerate(values):
+        if raw is None or not _is_finite(raw):
+            missing += 1
+        else:
+            total += max(0.0, float(raw))
+        if index >= duration:
+            previous = values[index - duration]
+            if previous is None or not _is_finite(previous):
+                missing -= 1
+            else:
+                total -= max(0.0, float(previous))
+        if index >= duration - 1 and missing == 0 and total > 0:
+            events.append({"value": total, "endIndex": index})
+    return events
+
+
+def percentile_value(values: list[float], percentile: float) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(float(value) for value in values)
+    rank = clamp((percentile / 100.0) * (len(ordered) - 1), 0.0, float(len(ordered) - 1))
+    lower_index = int(math.floor(rank))
+    upper_index = int(math.ceil(rank))
+    if lower_index == upper_index:
+        return ordered[lower_index]
+    weight = rank - lower_index
+    return ordered[lower_index] * (1 - weight) + ordered[upper_index] * weight
+
+
+def probability_for_return_period(return_period: int, event_rate: float, series_method: str) -> float:
+    if series_method == "pds":
+        annual_exceedance = 1 / max(return_period, 1)
+        safe_rate = max(event_rate, 1e-6)
+        probability = 1 + math.log(max(1e-12, 1 - annual_exceedance)) / safe_rate
+        return clamp(probability, 1e-6, 1 - 1e-6)
+    return clamp(1 - 1 / max(return_period, 1), 1e-6, 1 - 1e-6)
 
 
 def rolling_max_event(values: list[Any], duration: int) -> dict[str, Any]:
@@ -424,26 +626,153 @@ def average_numbers(values: list[float | None]) -> float | None:
     return sum(samples) / len(samples) if samples else None
 
 
+def compare_distributions(samples: list[float]) -> dict[str, dict[str, Any]]:
+    diagnostics = {}
+    for distribution in DISTRIBUTIONS:
+        fit = fit_distribution(samples, distribution)
+        diagnostics[distribution] = {
+            **fit,
+            "aic": calculate_aic(samples, fit),
+            "ks": calculate_ks_statistic(samples, fit),
+            "ksPValue": ks_p_value(len(samples), calculate_ks_statistic(samples, fit)),
+            "ad": calculate_ad_statistic(samples, fit),
+        }
+    ranked = sorted(diagnostics.items(), key=lambda item: (item[1]["aic"], item[1]["ks"], item[1]["ad"]))
+    for index, (distribution, values) in enumerate(ranked, start=1):
+        values["rank"] = index
+        values["distribution"] = distribution
+    return diagnostics
+
+
+def fit_distribution(samples: list[float], distribution: str) -> dict[str, Any]:
+    if distribution == "gumbel":
+        parameters = fit_gumbel(samples)
+        return {
+            "distribution": distribution,
+            "parameters": parameters,
+            "parameterText": f"mu {parameters['location']:.2f}, beta {parameters['scale']:.2f}",
+            "parameterCount": 2,
+        }
+    if distribution == "gev":
+        parameters = fit_gev_by_lmoments(samples)
+        return {
+            "distribution": distribution,
+            "parameters": parameters,
+            "parameterText": f"mu {parameters['location']:.2f}, sigma {parameters['scale']:.2f}, xi {-parameters['shape']:.3f}",
+            "parameterCount": 3,
+        }
+    logs = [math.log10(value) for value in samples if value > 0]
+    avg = mean(logs)
+    sd = standard_deviation(logs)
+    skew = skewness(logs)
+    return {
+        "distribution": distribution,
+        "parameters": build_lp3_parameters(avg, sd, skew),
+        "parameterText": f"log ort. {avg:.3f}, Cs {skew:.3f}",
+        "parameterCount": 3,
+    }
+
+
 def estimate_quantile(samples: list[float], return_period: int, distribution: str) -> float:
     probability = 1 - 1 / return_period
-    if distribution == "gumbel":
-        stats = fit_gumbel(samples)
-        return gumbel_quantile(probability, stats["location"], stats["scale"])
-    if distribution == "gev":
-        stats = fit_gev_by_lmoments(samples)
-        return gev_quantile(probability, stats["location"], stats["scale"], stats["shape"])
-    return log_pearson_3_quantile(samples, probability)
+    return quantile_from_fit(fit_distribution(samples, distribution), probability)
 
 
 def describe_fit(samples: list[float], distribution: str) -> str:
+    return fit_distribution(samples, distribution)["parameterText"]
+
+
+def quantile_from_fit(fit: dict[str, Any], probability: float) -> float:
+    distribution = fit["distribution"]
+    parameters = fit["parameters"]
+    probability = clamp(probability, 1e-6, 1 - 1e-6)
     if distribution == "gumbel":
-        fit = fit_gumbel(samples)
-        return f"mu {fit['location']:.2f}, beta {fit['scale']:.2f}"
+        return gumbel_quantile(probability, parameters["location"], parameters["scale"])
     if distribution == "gev":
-        fit = fit_gev_by_lmoments(samples)
-        return f"mu {fit['location']:.2f}, sigma {fit['scale']:.2f}, xi {-fit['shape']:.3f}"
-    logs = [math.log10(value) for value in samples]
-    return f"log ort. {mean(logs):.3f}, Cs {skewness(logs):.3f}"
+        return gev_quantile(probability, parameters["location"], parameters["scale"], parameters["shape"])
+    return lp3_quantile_from_parameters(parameters, probability)
+
+
+def calculate_aic(samples: list[float], fit: dict[str, Any]) -> float:
+    log_likelihood = sum(log_pdf(fit, sample) for sample in samples if sample > 0)
+    return 2 * fit["parameterCount"] - 2 * log_likelihood
+
+
+def calculate_ks_statistic(samples: list[float], fit: dict[str, Any]) -> float:
+    ordered = sorted(samples)
+    n = len(ordered)
+    max_diff = 0.0
+    for index, sample in enumerate(ordered, start=1):
+        cdf = clamp(cdf_value(fit, sample), 1e-12, 1 - 1e-12)
+        max_diff = max(max_diff, abs(cdf - index / n), abs(cdf - (index - 1) / n))
+    return max_diff
+
+
+def ks_p_value(sample_size: int, ks_statistic: float) -> float:
+    if sample_size <= 0:
+        return 0.0
+    z_value = (math.sqrt(sample_size) + 0.12 + 0.11 / math.sqrt(sample_size)) * ks_statistic
+    total = 0.0
+    for n_value in range(1, 8):
+        total += ((-1) ** (n_value - 1)) * math.exp(-2 * (z_value ** 2) * (n_value ** 2))
+    return clamp(2 * total, 0.0, 1.0)
+
+
+def calculate_ad_statistic(samples: list[float], fit: dict[str, Any]) -> float:
+    ordered = sorted(samples)
+    n = len(ordered)
+    if n == 0:
+        return 0.0
+    total = 0.0
+    for index, sample in enumerate(ordered, start=1):
+        cdf_low = clamp(cdf_value(fit, sample), 1e-12, 1 - 1e-12)
+        cdf_high = clamp(cdf_value(fit, ordered[-index]), 1e-12, 1 - 1e-12)
+        total += (2 * index - 1) * (math.log(cdf_low) + math.log(1 - cdf_high))
+    return -n - total / n
+
+
+def bootstrap_confidence_intervals(
+    samples: list[float],
+    distribution: str,
+    probabilities: list[float],
+    bootstrap_samples: int,
+) -> tuple[list[float], list[float]]:
+    rng = random.Random(42)
+    boot_quantiles = [[] for _ in probabilities]
+    resample_count = max(int(bootstrap_samples), 20)
+    for _ in range(resample_count):
+        resample = [samples[rng.randrange(len(samples))] for _ in range(len(samples))]
+        fit = fit_distribution(resample, distribution)
+        for index, probability in enumerate(probabilities):
+            boot_quantiles[index].append(quantile_from_fit(fit, probability))
+    lower_rank = (1 - CONFIDENCE_LEVEL) / 2 * 100
+    upper_rank = (1 + CONFIDENCE_LEVEL) / 2 * 100
+    lower = [percentile_value(values, lower_rank) for values in boot_quantiles]
+    upper = [percentile_value(values, upper_rank) for values in boot_quantiles]
+    return lower, upper
+
+
+def cdf_value(fit: dict[str, Any], sample: float) -> float:
+    distribution = fit["distribution"]
+    parameters = fit["parameters"]
+    if distribution == "gumbel":
+        z_value = (sample - parameters["location"]) / max(parameters["scale"], 1e-12)
+        return math.exp(-math.exp(-z_value))
+    if distribution == "gev":
+        return gev_cdf(sample, parameters["location"], parameters["scale"], parameters["shape"])
+    return lp3_cdf(sample, parameters)
+
+
+def log_pdf(fit: dict[str, Any], sample: float) -> float:
+    distribution = fit["distribution"]
+    parameters = fit["parameters"]
+    sample = max(sample, 1e-12)
+    if distribution == "gumbel":
+        z_value = (sample - parameters["location"]) / max(parameters["scale"], 1e-12)
+        return -math.log(max(parameters["scale"], 1e-12)) - z_value - math.exp(-z_value)
+    if distribution == "gev":
+        return gev_log_pdf(sample, parameters["location"], parameters["scale"], parameters["shape"])
+    return lp3_log_pdf(sample, parameters)
 
 
 def fit_gumbel(samples: list[float]) -> dict[str, float]:
@@ -498,20 +827,102 @@ def gev_quantile(probability: float, location: float, scale: float, shape: float
     return location + (scale * (1 - math.pow(y_value, shape))) / shape
 
 
+def gev_cdf(sample: float, location: float, scale: float, shape: float) -> float:
+    if scale <= 0:
+        return 0.0
+    z_value = (sample - location) / scale
+    if abs(shape) < 0.000001:
+        return math.exp(-math.exp(-z_value))
+    t_value = 1 - shape * z_value
+    if t_value <= 0:
+        return 0.0 if shape < 0 else 1.0
+    return math.exp(-math.pow(t_value, 1 / shape))
+
+
+def gev_log_pdf(sample: float, location: float, scale: float, shape: float) -> float:
+    if scale <= 0:
+        return float("-inf")
+    z_value = (sample - location) / scale
+    if abs(shape) < 0.000001:
+        return -math.log(scale) - z_value - math.exp(-z_value)
+    t_value = 1 - shape * z_value
+    if t_value <= 0:
+        return float("-inf")
+    return -math.log(scale) + (1 / shape - 1) * math.log(t_value) - math.pow(t_value, 1 / shape)
+
+
 def log_pearson_3_quantile(samples: list[float], probability: float) -> float:
     logs = [math.log10(value) for value in samples if value > 0]
     avg = mean(logs)
     sd = standard_deviation(logs)
     skew = skewness(logs)
+    return lp3_quantile_from_parameters(build_lp3_parameters(avg, sd, skew), probability)
+
+
+def build_lp3_parameters(avg: float, sd: float, skew: float) -> dict[str, float]:
+    parameters = {"mean_log": avg, "sd_log": sd, "skew_log": skew}
     if sd == 0:
-        return math.pow(10, avg)
+        return {**parameters, "mode": "degenerate", "alpha": 0.0, "beta": 0.0, "location": avg}
     if abs(skew) < 0.0001:
-        return math.pow(10, avg + sd * inverse_normal(probability))
+        return {**parameters, "mode": "normal", "alpha": 0.0, "beta": 0.0, "location": avg}
     alpha = 4 / (skew * skew)
     beta = (sd * skew) / 2
     location = avg - beta * alpha
+    return {**parameters, "mode": "gamma", "alpha": alpha, "beta": beta, "location": location}
+
+
+def lp3_quantile_from_parameters(parameters: dict[str, float], probability: float) -> float:
+    probability = clamp(probability, 1e-6, 1 - 1e-6)
+    if parameters["mode"] == "degenerate":
+        return math.pow(10, parameters["mean_log"])
+    if parameters["mode"] == "normal":
+        return math.pow(10, parameters["mean_log"] + parameters["sd_log"] * inverse_normal(probability))
+    beta = parameters["beta"]
     gamma_probability = probability if beta > 0 else 1 - probability
-    return math.pow(10, location + beta * inverse_regularized_gamma_p(alpha, gamma_probability))
+    return math.pow(
+        10,
+        parameters["location"] + beta * inverse_regularized_gamma_p(parameters["alpha"], gamma_probability),
+    )
+
+
+def lp3_cdf(sample: float, parameters: dict[str, float]) -> float:
+    if sample <= 0:
+        return 0.0
+    y_value = math.log10(sample)
+    if parameters["mode"] == "degenerate":
+        return 1.0 if y_value >= parameters["mean_log"] else 0.0
+    if parameters["mode"] == "normal":
+        z_value = (y_value - parameters["mean_log"]) / max(parameters["sd_log"], 1e-12)
+        return 0.5 * (1 + math.erf(z_value / math.sqrt(2)))
+    beta = parameters["beta"]
+    z_value = (y_value - parameters["location"]) / beta
+    if z_value <= 0:
+        return 0.0 if beta > 0 else 1.0
+    gamma_cdf = regularized_gamma_p(parameters["alpha"], z_value)
+    return gamma_cdf if beta > 0 else 1 - gamma_cdf
+
+
+def lp3_log_pdf(sample: float, parameters: dict[str, float]) -> float:
+    if sample <= 0:
+        return float("-inf")
+    y_value = math.log10(sample)
+    if parameters["mode"] == "degenerate":
+        return 0.0 if abs(y_value - parameters["mean_log"]) < 1e-12 else float("-inf")
+    if parameters["mode"] == "normal":
+        sd = max(parameters["sd_log"], 1e-12)
+        z_value = (y_value - parameters["mean_log"]) / sd
+        return -math.log(sample * math.log(10) * sd * math.sqrt(2 * math.pi)) - 0.5 * z_value * z_value
+    beta = parameters["beta"]
+    z_value = (y_value - parameters["location"]) / beta
+    if z_value <= 0:
+        return float("-inf")
+    return (
+        -log_gamma(parameters["alpha"])
+        + (parameters["alpha"] - 1) * math.log(z_value)
+        - z_value
+        - math.log(abs(beta))
+        - math.log(sample * math.log(10))
+    )
 
 
 def mean(values: list[float]) -> float:

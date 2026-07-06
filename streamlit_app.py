@@ -8,10 +8,14 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from streamlit_backend import (
+    CONFIDENCE_LEVEL,
     DEFAULT_END_YEAR,
+    DEFAULT_PDS_GAP_HOURS,
+    DEFAULT_PDS_PERCENTILE,
     DEFAULT_LOCATION,
     DISTRIBUTIONS,
     RETURN_PERIODS,
+    SERIES_METHODS,
     calculate_analysis,
     format_candidate,
     get_open_meteo_config,
@@ -119,18 +123,27 @@ def update_manual_coordinates() -> None:
     st.rerun()
 
 
-def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     idf_rows = []
     runoff_rows = []
     chart_rows = []
+    diagnostics_rows = []
     for duration in result["durations"]:
         row = {
             "Sure (saat)": duration["duration"],
             "Seri ort. (mm/saat)": duration["sampleMean"] / duration["duration"],
-            "Parametre": duration["parameterText"],
+            "Ornek sayisi": duration["sampleSize"],
+            "Secili parametre": duration["parameterText"],
         }
-        for period, intensity in zip(result["returnPeriods"], duration["intensities"]):
+        for period, intensity, low, high in zip(
+            result["returnPeriods"],
+            duration["intensities"],
+            duration["intensityLower"],
+            duration["intensityUpper"],
+        ):
             row[f"{period} yil"] = intensity
+            row[f"{period} yil alt"] = low
+            row[f"{period} yil ust"] = high
             chart_rows.append(
                 {
                     "Sure (saat)": duration["duration"],
@@ -150,11 +163,30 @@ def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Dat
                 "Kar derinligi (m)": duration["runoffSummary"]["snowDepth"],
             }
         )
-    return pd.DataFrame(idf_rows), pd.DataFrame(runoff_rows), pd.DataFrame(chart_rows)
+        for distribution_key, values in duration["fitDiagnostics"].items():
+            diagnostics_rows.append(
+                {
+                    "Sure (saat)": duration["duration"],
+                    "Seri": result["seriesMethod"].upper(),
+                    "Dagilim": DISTRIBUTIONS[distribution_key],
+                    "Sira": values["rank"],
+                    "AIC": values["aic"],
+                    "KS": values["ks"],
+                    "KS p": values["ksPValue"],
+                    "AD": values["ad"],
+                    "Parametre": values["parameterText"],
+                }
+            )
+    return (
+        pd.DataFrame(idf_rows),
+        pd.DataFrame(runoff_rows),
+        pd.DataFrame(chart_rows),
+        pd.DataFrame(diagnostics_rows),
+    )
 
 
 def result_to_csv_bytes(result: dict) -> bytes:
-    idf_df, runoff_df, _ = analysis_to_frames(result)
+    idf_df, runoff_df, _, diagnostics_df = analysis_to_frames(result)
     buffer = io.StringIO()
     meta = pd.DataFrame(
         [
@@ -162,6 +194,8 @@ def result_to_csv_bytes(result: dict) -> bytes:
             ["enlem", result["location"]["latitude"]],
             ["boylam", result["location"]["longitude"]],
             ["dagilim", result["distribution"]],
+            ["seri_turu", result["seriesMethod"]],
+            ["guven_duzeyi", result["confidenceLevel"]],
             ["baslangic_yili", result["startYear"]],
             ["bitis_yili", result["endYear"]],
             ["olusturma_zamani", result["generatedAt"]],
@@ -173,6 +207,8 @@ def result_to_csv_bytes(result: dict) -> bytes:
     idf_df.to_csv(buffer, index=False)
     buffer.write("\nAKIS_PARAMETRELERI\n")
     runoff_df.to_csv(buffer, index=False)
+    buffer.write("\nDAGILIM_TANILARI\n")
+    diagnostics_df.to_csv(buffer, index=False)
     return buffer.getvalue().encode("utf-8")
 
 
@@ -267,7 +303,35 @@ with left:
         options=list(DISTRIBUTIONS.keys()),
         format_func=lambda key: DISTRIBUTIONS[key],
     )
-    st.caption("Cache anahtari: konum + yil araligi + dagilim. Ham Open-Meteo parcaciklari da diskte tutulur.")
+    series_method = st.selectbox(
+        "Seri tipi",
+        options=list(SERIES_METHODS.keys()),
+        format_func=lambda key: SERIES_METHODS[key],
+    )
+    pds_percentile = DEFAULT_PDS_PERCENTILE
+    pds_gap_hours = DEFAULT_PDS_GAP_HOURS
+    if series_method == "pds":
+        pds_col1, pds_col2 = st.columns(2)
+        with pds_col1:
+            pds_percentile = st.number_input(
+                "PDS esik yuzdesi",
+                min_value=90.0,
+                max_value=99.9,
+                value=DEFAULT_PDS_PERCENTILE,
+                step=0.5,
+            )
+        with pds_col2:
+            pds_gap_hours = st.number_input(
+                "Bagimsiz olay araligi",
+                min_value=6,
+                max_value=240,
+                value=DEFAULT_PDS_GAP_HOURS,
+                step=6,
+            )
+    st.caption(
+        "Cache anahtari: konum + yil araligi + dagilim + seri tipi. "
+        "Ham Open-Meteo parcaciklari da diskte tutulur."
+    )
 
     calculate_clicked = st.button("Tabloyu hesapla", type="primary", use_container_width=True)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -276,10 +340,11 @@ with right:
     status_box = st.empty()
 
 if calculate_clicked:
+    minimum_years = 8 if series_method == "ams" else 5
     if start_year > end_year:
         st.error("Baslangic yili bitis yilindan buyuk olamaz.")
-    elif end_year - start_year + 1 < 8:
-        st.error("Frekans analizi icin en az 8 yillik seri secin.")
+    elif end_year - start_year + 1 < minimum_years:
+        st.error(f"{SERIES_METHODS[series_method]} icin en az {minimum_years} yillik seri secin.")
     else:
         progress = status_box.progress(0, text="Analiz baslatiliyor...")
 
@@ -293,6 +358,9 @@ if calculate_clicked:
                     int(start_year),
                     int(end_year),
                     distribution,
+                    series_method=series_method,
+                    pds_percentile=float(pds_percentile),
+                    pds_gap_hours=int(pds_gap_hours),
                     progress_callback=report_progress,
                 )
         except Exception as exc:
@@ -309,20 +377,51 @@ with right:
     if result is None:
         st.info("Sonuc burada gosterilecek. Konumu secip hesaplamayi baslatin.")
     else:
-        metric1, metric2, metric3 = st.columns(3)
+        metric1, metric2, metric3, metric4 = st.columns(4)
         metric1.metric("Veri kapsami", f"{result['yearsUsed']} yil")
         metric2.metric("Eksik saat", f"{result['missingHours']:,}".replace(",", "."))
         metric3.metric("Yinelenme", f"{RETURN_PERIODS[0]}-{RETURN_PERIODS[-1]} yil")
+        metric4.metric("Seri tipi", result["seriesMethod"].upper())
 
-        idf_df, runoff_df, chart_df = analysis_to_frames(result)
+        idf_df, runoff_df, chart_df, diagnostics_df = analysis_to_frames(result)
 
-        st.subheader(f"{DISTRIBUTIONS[result['distribution']]} IDF tablosu")
-        chart_pivot = chart_df.pivot(index="Sure (saat)", columns="Yinelenme", values="Yogunluk")
-        st.line_chart(chart_pivot)
-        st.dataframe(idf_df.round(3), use_container_width=True, hide_index=True)
+        st.caption(
+            f"Secili dagilim: {DISTRIBUTIONS[result['distribution']]} | "
+            f"Seri: {result['seriesMethodLabel']} | "
+            f"{int(CONFIDENCE_LEVEL * 100)}% bootstrap guven araligi"
+        )
 
-        st.subheader("Akis parametreleri")
-        st.dataframe(runoff_df.round(4), use_container_width=True, hide_index=True)
+        overview_tab, fit_tab, runoff_tab, mgm_tab = st.tabs(
+            ["IDF", "Dagilim Tanilari", "Akis", "MGM Karsilastirma"]
+        )
+
+        with overview_tab:
+            st.subheader(f"{DISTRIBUTIONS[result['distribution']]} IDF tablosu")
+            chart_pivot = chart_df.pivot(index="Sure (saat)", columns="Yinelenme", values="Yogunluk")
+            st.line_chart(chart_pivot)
+            st.dataframe(idf_df.round(3), use_container_width=True, hide_index=True)
+
+        with fit_tab:
+            best_fits = (
+                diagnostics_df.sort_values(["Sure (saat)", "Sira"])
+                .groupby("Sure (saat)", as_index=False)
+                .first()[["Sure (saat)", "Dagilim", "AIC", "KS", "KS p", "AD", "Parametre"]]
+            )
+            st.caption("Asagidaki tablo her sure icin en iyi siradaki dagilimi ozetler.")
+            st.dataframe(best_fits.round(4), use_container_width=True, hide_index=True)
+            st.caption("Tum aday dagilimlarin AIC / KS / AD karsilastirmasi")
+            st.dataframe(diagnostics_df.round(4), use_container_width=True, hide_index=True)
+
+        with runoff_tab:
+            st.subheader("Akis parametreleri")
+            st.dataframe(runoff_df.round(4), use_container_width=True, hide_index=True)
+
+        with mgm_tab:
+            st.info(result["mgmCrosscheck"]["message"])
+            st.caption(
+                "Hazir oldugunda MGM tarafinda saatlik zaman damgasi + yagis degerleri ile ayni durasyonlar uzerinden "
+                "capraz IDF karsilastirmasi eklenebilir."
+            )
 
         st.download_button(
             "CSV indir",
