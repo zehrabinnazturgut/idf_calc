@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import os
 
 import pandas as pd
 import streamlit as st
@@ -13,6 +14,7 @@ from streamlit_backend import (
     RETURN_PERIODS,
     calculate_analysis,
     format_candidate,
+    get_open_meteo_config,
     search_best_location,
 )
 
@@ -21,6 +23,20 @@ st.set_page_config(
     page_icon="IDF",
     layout="wide",
 )
+
+try:
+    secret_api_key = str(st.secrets.get("OPEN_METEO_API_KEY", "")).strip()
+except Exception:
+    secret_api_key = ""
+if secret_api_key and not os.getenv("OPEN_METEO_API_KEY"):
+    os.environ["OPEN_METEO_API_KEY"] = secret_api_key
+
+try:
+    secret_customer_base = str(st.secrets.get("OPEN_METEO_CUSTOMER_BASE", "")).strip()
+except Exception:
+    secret_customer_base = ""
+if secret_customer_base and not os.getenv("OPEN_METEO_CUSTOMER_BASE"):
+    os.environ["OPEN_METEO_CUSTOMER_BASE"] = secret_customer_base
 
 if "selected_location" not in st.session_state:
     st.session_state.selected_location = DEFAULT_LOCATION.copy()
@@ -32,6 +48,8 @@ if "latitude_input" not in st.session_state:
     st.session_state.latitude_input = f"{float(st.session_state.selected_location['latitude']):.4f}"
 if "longitude_input" not in st.session_state:
     st.session_state.longitude_input = f"{float(st.session_state.selected_location['longitude']):.4f}"
+if "open_meteo_api_key_input" not in st.session_state:
+    st.session_state.open_meteo_api_key_input = ""
 
 pending_location_sync = st.session_state.pop("pending_location_sync", None)
 if pending_location_sync is not None:
@@ -42,6 +60,19 @@ if pending_location_sync is not None:
 
 def queue_location_sync(location: dict) -> None:
     st.session_state.pending_location_sync = location.copy()
+
+
+def apply_open_meteo_api_key() -> None:
+    api_key = st.session_state.open_meteo_api_key_input.strip()
+    if api_key:
+        os.environ["OPEN_METEO_API_KEY"] = api_key
+        st.session_state.analysis_result = None
+        st.success("Open-Meteo ticari API anahtari etkinlestirildi.")
+    else:
+        os.environ.pop("OPEN_METEO_API_KEY", None)
+        st.session_state.analysis_result = None
+        st.info("Open-Meteo API anahtari temizlendi. Ucretsiz uca donuldu.")
+    st.rerun()
 
 
 def search_and_select() -> None:
@@ -183,11 +214,23 @@ st.markdown(
 st.title("Intensity-Duration-Frequency tablosu")
 st.caption("Streamlit backend + disk cache ile Open-Meteo destekli IDF analizi")
 
+open_meteo_config = get_open_meteo_config()
+
 left, right = st.columns([1, 1.8], gap="large")
 
 with left:
     st.markdown('<div class="block-card">', unsafe_allow_html=True)
     st.subheader("Girdi")
+    if open_meteo_config["use_customer_api"]:
+        st.success("Open-Meteo ticari API aktif")
+    else:
+        st.warning("Open-Meteo ucretsiz API aktif")
+
+    with st.expander("Open-Meteo API ayari", expanded=False):
+        st.caption("Anahtari istersen burada runtime icin tanimlayabilir ya da Streamlit Secrets'e OPEN_METEO_API_KEY olarak ekleyebilirsin.")
+        st.text_input("Open-Meteo API key", key="open_meteo_api_key_input", type="password", placeholder="apikey...")
+        st.button("API key uygula", on_click=apply_open_meteo_api_key, use_container_width=True)
+
     search_col, button_col = st.columns([4, 1])
     with search_col:
         st.text_input("Konum veya mekan adi", key="search_input", placeholder="Anitkabir, Galata Kulesi, Rize...")

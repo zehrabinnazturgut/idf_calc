@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +31,7 @@ ARCHIVE_CHUNK_YEARS = 12
 DEFAULT_END_YEAR = 2025
 OPEN_METEO_ARCHIVE = "https://archive-api.open-meteo.com/v1/archive"
 OPEN_METEO_GEOCODING = "https://geocoding-api.open-meteo.com/v1/search"
+OPEN_METEO_CUSTOMER_BASE = "https://customer-api.open-meteo.com"
 NOMINATIM_SEARCH = "https://nominatim.openstreetmap.org/search"
 REQUEST_TIMEOUT = 90
 CACHE_ROOT = Path("work/streamlit_cache")
@@ -52,6 +54,21 @@ def format_candidate(candidate: dict[str, Any]) -> str:
     return ", ".join(
         [part for part in [candidate.get("name"), candidate.get("admin1"), candidate.get("country")] if part]
     )
+
+
+def get_open_meteo_config() -> dict[str, Any]:
+    api_key = (os.getenv("OPEN_METEO_API_KEY") or "").strip()
+    customer_base = (os.getenv("OPEN_METEO_CUSTOMER_BASE") or OPEN_METEO_CUSTOMER_BASE).rstrip("/")
+    use_customer_api = bool(api_key)
+    archive_url = f"{customer_base}/v1/archive" if use_customer_api else OPEN_METEO_ARCHIVE
+    geocoding_url = f"{customer_base}/v1/search" if use_customer_api else OPEN_METEO_GEOCODING
+    return {
+        "api_key": api_key,
+        "use_customer_api": use_customer_api,
+        "archive_url": archive_url,
+        "geocoding_url": geocoding_url,
+        "archive_host": customer_base if use_customer_api else "free",
+    }
 
 
 def _cache_path(namespace: str, key: dict[str, Any]) -> Path:
@@ -81,8 +98,18 @@ def _cache_write(namespace: str, key: dict[str, Any], value: Any) -> None:
     path.write_text(json.dumps(envelope, ensure_ascii=False), encoding="utf-8")
 
 
-def _session_get_json(url: str, params: dict[str, Any]) -> tuple[int, dict[str, Any]]:
-    response = requests.get(url, params=params, timeout=REQUEST_TIMEOUT, headers={"User-Agent": "Codex-IDF-Streamlit/1.0"})
+def _session_get_json(url: str, params: dict[str, Any], include_api_key: bool = False) -> tuple[int, dict[str, Any]]:
+    request_params = dict(params)
+    if include_api_key:
+        config = get_open_meteo_config()
+        if config["api_key"]:
+            request_params["apikey"] = config["api_key"]
+    response = requests.get(
+        url,
+        params=request_params,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": "Codex-IDF-Streamlit/1.0"},
+    )
     try:
         payload = response.json()
     except ValueError:
@@ -141,9 +168,11 @@ def _search_nominatim(query: str) -> dict[str, Any] | None:
 
 
 def _search_open_meteo(query: str) -> dict[str, Any] | None:
+    config = get_open_meteo_config()
     status, payload = _session_get_json(
-        OPEN_METEO_GEOCODING,
+        config["geocoding_url"],
         {"name": query, "count": 1, "language": "tr", "format": "json"},
+        include_api_key=config["use_customer_api"],
     )
     results = payload.get("results", []) if isinstance(payload, dict) else []
     if status != 200 or not results:
@@ -166,6 +195,7 @@ def calculate_analysis(
         "distribution": distribution,
         "variables": RUNOFF_VARIABLES,
         "chunk_years": ARCHIVE_CHUNK_YEARS,
+        "commercial_api": get_open_meteo_config()["use_customer_api"],
     }
     cached = _cache_read("analysis", query_key, ANALYSIS_CACHE_TTL)
     if cached is not None:
@@ -185,6 +215,7 @@ def fetch_archive_by_year(
     end_year: int,
     progress_callback: Callable[[str, float], None] | None = None,
 ) -> list[dict[str, Any]]:
+    config = get_open_meteo_config()
     total = end_year - start_year + 1
     rows: list[dict[str, Any]] = []
     processed = 0
@@ -200,11 +231,12 @@ def fetch_archive_by_year(
             "end_year": chunk_end,
             "variables": RUNOFF_VARIABLES,
             "model": "era5",
+            "commercial_api": config["use_customer_api"],
         }
         payload = _cache_read("archive", cache_key, ARCHIVE_CACHE_TTL)
         if payload is None:
             status, payload = _session_get_json(
-                OPEN_METEO_ARCHIVE,
+                config["archive_url"],
                 {
                     "latitude": location["latitude"],
                     "longitude": location["longitude"],
@@ -214,6 +246,7 @@ def fetch_archive_by_year(
                     "models": "era5",
                     "timezone": location.get("timezone", "auto"),
                 },
+                include_api_key=config["use_customer_api"],
             )
             if status != 200 or payload.get("reason"):
                 raise RuntimeError(_build_archive_error_message(status, payload, chunk_start, chunk_end))

@@ -6,6 +6,6 @@ from .idf_backend import (
     build_analysis,
     calculate_analysis,
     format_candidate,
+    get_open_meteo_config,
     search_best_location,
 )
-
