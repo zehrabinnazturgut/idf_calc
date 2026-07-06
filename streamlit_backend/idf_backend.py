@@ -20,6 +20,10 @@ SERIES_METHODS = {
     "ams": "Annual Maximum Series",
     "pds": "Partial Duration Series",
 }
+RAINFALL_VARIABLES = {
+    "precipitation": "Toplam yagis",
+    "rain": "Sivi yagis",
+}
 RUNOFF_VARIABLES = [
     "precipitation",
     "rain",
@@ -193,6 +197,7 @@ def calculate_analysis(
     start_year: int,
     end_year: int,
     distribution: str,
+    rainfall_variable: str = "precipitation",
     series_method: str = "ams",
     pds_percentile: float = DEFAULT_PDS_PERCENTILE,
     pds_gap_hours: int = DEFAULT_PDS_GAP_HOURS,
@@ -205,6 +210,7 @@ def calculate_analysis(
         "start_year": int(start_year),
         "end_year": int(end_year),
         "distribution": distribution,
+        "rainfall_variable": rainfall_variable,
         "series_method": series_method,
         "pds_percentile": round(float(pds_percentile), 3),
         "pds_gap_hours": int(pds_gap_hours),
@@ -226,6 +232,7 @@ def calculate_analysis(
         distribution=distribution,
         start_year=start_year,
         end_year=end_year,
+        rainfall_variable=rainfall_variable,
         series_method=series_method,
         pds_percentile=pds_percentile,
         pds_gap_hours=pds_gap_hours,
@@ -330,6 +337,7 @@ def build_analysis(
     distribution: str,
     start_year: int,
     end_year: int,
+    rainfall_variable: str = "precipitation",
     series_method: str = "ams",
     pds_percentile: float = DEFAULT_PDS_PERCENTILE,
     pds_gap_hours: int = DEFAULT_PDS_GAP_HOURS,
@@ -346,6 +354,7 @@ def build_analysis(
         events, extraction_meta = extract_duration_records(
             yearly_series=yearly_series,
             duration=duration,
+            rainfall_variable=rainfall_variable,
             series_method=series_method,
             pds_percentile=pds_percentile,
             pds_gap_hours=pds_gap_hours,
@@ -390,6 +399,8 @@ def build_analysis(
     return {
         "location": location,
         "distribution": distribution,
+        "rainfallVariable": rainfall_variable,
+        "rainfallVariableLabel": RAINFALL_VARIABLES.get(rainfall_variable, rainfall_variable),
         "seriesMethod": series_method,
         "seriesMethodLabel": SERIES_METHODS.get(series_method, series_method),
         "pdsPercentile": pds_percentile,
@@ -413,16 +424,17 @@ def build_analysis(
 def extract_duration_records(
     yearly_series: list[dict[str, Any]],
     duration: int,
+    rainfall_variable: str,
     series_method: str,
     pds_percentile: float,
     pds_gap_hours: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     if series_method == "pds":
-        return extract_partial_duration_records(yearly_series, duration, pds_percentile, pds_gap_hours)
+        return extract_partial_duration_records(yearly_series, duration, rainfall_variable, pds_percentile, pds_gap_hours)
     records = []
     years_with_event = 0
     for series in yearly_series:
-        event = rolling_max_event(series["values"], duration)
+        event = rolling_max_event(series_value_array(series, rainfall_variable), duration)
         if event["value"] is None or event["value"] <= 0:
             continue
         years_with_event += 1
@@ -443,13 +455,14 @@ def extract_duration_records(
 def extract_partial_duration_records(
     yearly_series: list[dict[str, Any]],
     duration: int,
+    rainfall_variable: str,
     percentile: float,
     gap_hours: int,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     candidate_records = []
     candidate_values = []
     for series in yearly_series:
-        for event in rolling_window_events(series["values"], duration):
+        for event in rolling_window_events(series_value_array(series, rainfall_variable), duration):
             if event["value"] is None or event["value"] <= 0:
                 continue
             record = {"series": series, "event": event, "year": series["year"]}
@@ -541,6 +554,13 @@ def probability_for_return_period(return_period: int, event_rate: float, series_
         probability = 1 + math.log(max(1e-12, 1 - annual_exceedance)) / safe_rate
         return clamp(probability, 1e-6, 1 - 1e-6)
     return clamp(1 - 1 / max(return_period, 1), 1e-6, 1 - 1e-6)
+
+
+def series_value_array(series: dict[str, Any], rainfall_variable: str) -> list[Any]:
+    values = series.get("hourly", {}).get(rainfall_variable)
+    if isinstance(values, list):
+        return values
+    return []
 
 
 def rolling_max_event(values: list[Any], duration: int) -> dict[str, Any]:

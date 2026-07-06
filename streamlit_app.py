@@ -14,6 +14,7 @@ from streamlit_backend import (
     DEFAULT_PDS_PERCENTILE,
     DEFAULT_LOCATION,
     DISTRIBUTIONS,
+    RAINFALL_VARIABLES,
     RETURN_PERIODS,
     SERIES_METHODS,
     calculate_analysis,
@@ -52,8 +53,6 @@ if "latitude_input" not in st.session_state:
     st.session_state.latitude_input = f"{float(st.session_state.selected_location['latitude']):.4f}"
 if "longitude_input" not in st.session_state:
     st.session_state.longitude_input = f"{float(st.session_state.selected_location['longitude']):.4f}"
-if "open_meteo_api_key_input" not in st.session_state:
-    st.session_state.open_meteo_api_key_input = ""
 
 pending_location_sync = st.session_state.pop("pending_location_sync", None)
 if pending_location_sync is not None:
@@ -64,19 +63,6 @@ if pending_location_sync is not None:
 
 def queue_location_sync(location: dict) -> None:
     st.session_state.pending_location_sync = location.copy()
-
-
-def apply_open_meteo_api_key() -> None:
-    api_key = st.session_state.open_meteo_api_key_input.strip()
-    if api_key:
-        os.environ["OPEN_METEO_API_KEY"] = api_key
-        st.session_state.analysis_result = None
-        st.success("Open-Meteo ticari API anahtari etkinlestirildi.")
-    else:
-        os.environ.pop("OPEN_METEO_API_KEY", None)
-        st.session_state.analysis_result = None
-        st.info("Open-Meteo API anahtari temizlendi. Ucretsiz uca donuldu.")
-    st.rerun()
 
 
 def search_and_select() -> None:
@@ -123,11 +109,8 @@ def update_manual_coordinates() -> None:
     st.rerun()
 
 
-def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     idf_rows = []
-    runoff_rows = []
-    chart_rows = []
-    diagnostics_rows = []
     for duration in result["durations"]:
         row = {
             "Sure (saat)": duration["duration"],
@@ -144,49 +127,33 @@ def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame, pd.Dat
             row[f"{period} yil"] = intensity
             row[f"{period} yil alt"] = low
             row[f"{period} yil ust"] = high
-            chart_rows.append(
-                {
-                    "Sure (saat)": duration["duration"],
-                    "Yinelenme": f"{period} yil",
-                    "Yogunluk": intensity,
-                }
-            )
         idf_rows.append(row)
-        runoff_rows.append(
+        for distribution_key, values in duration["fitDiagnostics"].items():
+            row[f"diag_{distribution_key}_rank"] = values["rank"]
+            row[f"diag_{distribution_key}_aic"] = values["aic"]
+            row[f"diag_{distribution_key}_ks"] = values["ks"]
+            row[f"diag_{distribution_key}_ad"] = values["ad"]
+    diagnostics_rows = []
+    for duration in result["durations"]:
+        selected = duration["fitDiagnostics"][result["distribution"]]
+        diagnostics_rows.append(
             {
                 "Sure (saat)": duration["duration"],
-                "Olay yagmuru (mm)": duration["runoffSummary"]["eventRain"],
-                "Olay kari (cm)": duration["runoffSummary"]["eventSnowfall"],
-                "Oncul 72s yagis (mm)": duration["runoffSummary"]["antecedentPrecip72h"],
-                "Toprak nemi 0-7": duration["runoffSummary"]["soilMoistureTop"],
-                "Kok bolgesi nemi": duration["runoffSummary"]["soilMoistureRoot"],
-                "Kar derinligi (m)": duration["runoffSummary"]["snowDepth"],
+                "Secili dagilim": DISTRIBUTIONS[result["distribution"]],
+                "Dagilim sirasi": selected["rank"],
+                "AIC": selected["aic"],
+                "KS": selected["ks"],
+                "KS p": selected["ksPValue"],
+                "AD": selected["ad"],
+                "Olay sayisi": duration["sampleSize"],
+                "Olay/yil": duration["seriesMeta"]["eventRate"],
             }
         )
-        for distribution_key, values in duration["fitDiagnostics"].items():
-            diagnostics_rows.append(
-                {
-                    "Sure (saat)": duration["duration"],
-                    "Seri": result["seriesMethod"].upper(),
-                    "Dagilim": DISTRIBUTIONS[distribution_key],
-                    "Sira": values["rank"],
-                    "AIC": values["aic"],
-                    "KS": values["ks"],
-                    "KS p": values["ksPValue"],
-                    "AD": values["ad"],
-                    "Parametre": values["parameterText"],
-                }
-            )
-    return (
-        pd.DataFrame(idf_rows),
-        pd.DataFrame(runoff_rows),
-        pd.DataFrame(chart_rows),
-        pd.DataFrame(diagnostics_rows),
-    )
+    return pd.DataFrame(idf_rows), pd.DataFrame(diagnostics_rows)
 
 
 def result_to_csv_bytes(result: dict) -> bytes:
-    idf_df, runoff_df, _, diagnostics_df = analysis_to_frames(result)
+    idf_df, diagnostics_df = analysis_to_frames(result)
     buffer = io.StringIO()
     meta = pd.DataFrame(
         [
@@ -195,6 +162,7 @@ def result_to_csv_bytes(result: dict) -> bytes:
             ["boylam", result["location"]["longitude"]],
             ["dagilim", result["distribution"]],
             ["seri_turu", result["seriesMethod"]],
+            ["yagis_temeli", result["rainfallVariable"]],
             ["guven_duzeyi", result["confidenceLevel"]],
             ["baslangic_yili", result["startYear"]],
             ["bitis_yili", result["endYear"]],
@@ -205,11 +173,33 @@ def result_to_csv_bytes(result: dict) -> bytes:
     meta.to_csv(buffer, index=False)
     buffer.write("\nIDF_TABLOSU\n")
     idf_df.to_csv(buffer, index=False)
-    buffer.write("\nAKIS_PARAMETRELERI\n")
-    runoff_df.to_csv(buffer, index=False)
     buffer.write("\nDAGILIM_TANILARI\n")
     diagnostics_df.to_csv(buffer, index=False)
     return buffer.getvalue().encode("utf-8")
+
+
+def build_result_comment(result: dict) -> str:
+    durations = result["durations"]
+    ranks = [duration["fitDiagnostics"][result["distribution"]]["rank"] for duration in durations]
+    rank_one_count = sum(1 for rank in ranks if rank == 1)
+    sample_sizes = [duration["sampleSize"] for duration in durations]
+    widest_ratio = 0.0
+    for duration in durations:
+        for central, low, high in zip(duration["intensities"], duration["intensityLower"], duration["intensityUpper"]):
+            if central > 0:
+                widest_ratio = max(widest_ratio, (high - low) / central)
+    confidence_text = "dar" if widest_ratio < 0.35 else "orta" if widest_ratio < 0.75 else "genis"
+    rank_text = (
+        "Secili dagilim tum surelerde en iyi uyumlu aday."
+        if rank_one_count == len(durations)
+        else f"Secili dagilim {len(durations)} surenin {rank_one_count} tanesinde en iyi uyumu verdi."
+    )
+    return (
+        f"Bu tablo {result['seriesMethodLabel']} ve {result['rainfallVariableLabel'].lower()} uzerinden uretildi. "
+        f"Ornek buyuklugu {min(sample_sizes)}-{max(sample_sizes)} araliginda. "
+        f"{int(CONFIDENCE_LEVEL * 100)}% guven bandi genel olarak {confidence_text}. "
+        f"{rank_text}"
+    )
 
 
 def render_google_map(location: dict) -> None:
@@ -261,11 +251,7 @@ with left:
         st.success("Open-Meteo ticari API aktif")
     else:
         st.warning("Open-Meteo ucretsiz API aktif")
-
-    with st.expander("Open-Meteo API ayari", expanded=False):
-        st.caption("Anahtari istersen burada runtime icin tanimlayabilir ya da Streamlit Secrets'e OPEN_METEO_API_KEY olarak ekleyebilirsin.")
-        st.text_input("Open-Meteo API key", key="open_meteo_api_key_input", type="password", placeholder="apikey...")
-        st.button("API key uygula", on_click=apply_open_meteo_api_key, use_container_width=True)
+    st.caption("API anahtari yalnizca Secrets/env uzerinden okunur.")
 
     search_col, button_col = st.columns([4, 1])
     with search_col:
@@ -302,6 +288,11 @@ with left:
         "Dagilim",
         options=list(DISTRIBUTIONS.keys()),
         format_func=lambda key: DISTRIBUTIONS[key],
+    )
+    rainfall_variable = st.selectbox(
+        "Yagis temeli",
+        options=list(RAINFALL_VARIABLES.keys()),
+        format_func=lambda key: RAINFALL_VARIABLES[key],
     )
     series_method = st.selectbox(
         "Seri tipi",
@@ -358,6 +349,7 @@ if calculate_clicked:
                     int(start_year),
                     int(end_year),
                     distribution,
+                    rainfall_variable=rainfall_variable,
                     series_method=series_method,
                     pds_percentile=float(pds_percentile),
                     pds_gap_hours=int(pds_gap_hours),
@@ -383,45 +375,15 @@ with right:
         metric3.metric("Yinelenme", f"{RETURN_PERIODS[0]}-{RETURN_PERIODS[-1]} yil")
         metric4.metric("Seri tipi", result["seriesMethod"].upper())
 
-        idf_df, runoff_df, chart_df, diagnostics_df = analysis_to_frames(result)
+        idf_df, diagnostics_df = analysis_to_frames(result)
 
         st.caption(
             f"Secili dagilim: {DISTRIBUTIONS[result['distribution']]} | "
-            f"Seri: {result['seriesMethodLabel']} | "
+            f"Yagis temeli: {result['rainfallVariableLabel']} | "
             f"{int(CONFIDENCE_LEVEL * 100)}% bootstrap guven araligi"
         )
-
-        overview_tab, fit_tab, runoff_tab, mgm_tab = st.tabs(
-            ["IDF", "Dagilim Tanilari", "Akis", "MGM Karsilastirma"]
-        )
-
-        with overview_tab:
-            st.subheader(f"{DISTRIBUTIONS[result['distribution']]} IDF tablosu")
-            chart_pivot = chart_df.pivot(index="Sure (saat)", columns="Yinelenme", values="Yogunluk")
-            st.line_chart(chart_pivot)
-            st.dataframe(idf_df.round(3), use_container_width=True, hide_index=True)
-
-        with fit_tab:
-            best_fits = (
-                diagnostics_df.sort_values(["Sure (saat)", "Sira"])
-                .groupby("Sure (saat)", as_index=False)
-                .first()[["Sure (saat)", "Dagilim", "AIC", "KS", "KS p", "AD", "Parametre"]]
-            )
-            st.caption("Asagidaki tablo her sure icin en iyi siradaki dagilimi ozetler.")
-            st.dataframe(best_fits.round(4), use_container_width=True, hide_index=True)
-            st.caption("Tum aday dagilimlarin AIC / KS / AD karsilastirmasi")
-            st.dataframe(diagnostics_df.round(4), use_container_width=True, hide_index=True)
-
-        with runoff_tab:
-            st.subheader("Akis parametreleri")
-            st.dataframe(runoff_df.round(4), use_container_width=True, hide_index=True)
-
-        with mgm_tab:
-            st.info(result["mgmCrosscheck"]["message"])
-            st.caption(
-                "Hazir oldugunda MGM tarafinda saatlik zaman damgasi + yagis degerleri ile ayni durasyonlar uzerinden "
-                "capraz IDF karsilastirmasi eklenebilir."
-            )
+        st.info(build_result_comment(result))
+        st.dataframe(idf_df.round(3), use_container_width=True, hide_index=True)
 
         st.download_button(
             "CSV indir",

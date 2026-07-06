@@ -5,6 +5,7 @@ from .idf_backend import (
     DEFAULT_PDS_PERCENTILE,
     DEFAULT_LOCATION,
     DISTRIBUTIONS,
+    RAINFALL_VARIABLES,
     RETURN_PERIODS,
     SERIES_METHODS,
     build_analysis,
