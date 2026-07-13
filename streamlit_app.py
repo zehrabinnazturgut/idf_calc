@@ -196,6 +196,22 @@ def chart_spec(data: pd.DataFrame) -> dict:
         "height": 410,
         "layer": [
             {
+                "mark": {"type": "area", "opacity": 0.10},
+                "encoding": {
+                    "x": {"field": "Süre (saat)", "type": "quantitative", "scale": {"type": "log"}},
+                    "y": {"field": "Alt sınır", "type": "quantitative", "title": "Şiddet (mm/saat)"},
+                    "y2": {"field": "Üst sınır"},
+                    "color": {"field": "Tekerrür dönemi", "type": "nominal"},
+                    "detail": {"field": "Tekerrür dönemi", "type": "nominal"},
+                    "tooltip": [
+                        {"field": "Tekerrür dönemi", "type": "nominal"},
+                        {"field": "Süre (saat)", "type": "quantitative"},
+                        {"field": "Alt sınır", "type": "quantitative", "format": ".2f"},
+                        {"field": "Üst sınır", "type": "quantitative", "format": ".2f"},
+                    ],
+                },
+            },
+            {
                 "mark": {"type": "line", "point": True, "strokeWidth": 2.5},
                 "encoding": {
                     "x": {"field": "Süre (saat)", "type": "quantitative", "scale": {"type": "log"}},
@@ -405,7 +421,10 @@ with right:
 
         with tabs[0]:
             st.markdown("#### Yağış şiddeti–süre–tekerrür eğrileri")
-            st.caption(f"Çizgiler merkezi tahmini gösterir. Hesaplanan güven düzeyi: %{int(CONFIDENCE_LEVEL * 100)}.")
+            st.caption(
+                f"Çizgiler merkezi tahmini, yarı saydam alanlar %{int(CONFIDENCE_LEVEL * 100)} "
+                "bootstrap güven aralığını gösterir."
+            )
             st.vega_lite_chart(chart_spec(chart_frame(result)), use_container_width=True)
 
         with tabs[1]:
