@@ -10,38 +10,31 @@ import streamlit.components.v1 as components
 from streamlit_backend import (
     CONFIDENCE_LEVEL,
     DEFAULT_END_YEAR,
+    DEFAULT_LOCATION,
     DEFAULT_PDS_GAP_HOURS,
     DEFAULT_PDS_PERCENTILE,
-    DEFAULT_LOCATION,
     DISTRIBUTIONS,
     RAINFALL_VARIABLES,
     RETURN_PERIODS,
     SERIES_METHODS,
     calculate_analysis,
     format_candidate,
-    get_open_meteo_config,
     search_best_location,
 )
 
-st.set_page_config(
-    page_title="IDF Yagis Analizi",
-    page_icon="IDF",
-    layout="wide",
-)
+
+st.set_page_config(page_title="Tasarım Yağışı ve IDF Analizi", page_icon="🌧️", layout="wide")
 
 try:
-    secret_api_key = str(st.secrets.get("OPEN_METEO_API_KEY", "")).strip()
+    api_key = str(st.secrets.get("OPEN_METEO_API_KEY", "")).strip()
+    customer_base = str(st.secrets.get("OPEN_METEO_CUSTOMER_BASE", "")).strip()
 except Exception:
-    secret_api_key = ""
-if secret_api_key and not os.getenv("OPEN_METEO_API_KEY"):
-    os.environ["OPEN_METEO_API_KEY"] = secret_api_key
-
-try:
-    secret_customer_base = str(st.secrets.get("OPEN_METEO_CUSTOMER_BASE", "")).strip()
-except Exception:
-    secret_customer_base = ""
-if secret_customer_base and not os.getenv("OPEN_METEO_CUSTOMER_BASE"):
-    os.environ["OPEN_METEO_CUSTOMER_BASE"] = secret_customer_base
+    api_key = ""
+    customer_base = ""
+if api_key and not os.getenv("OPEN_METEO_API_KEY"):
+    os.environ["OPEN_METEO_API_KEY"] = api_key
+if customer_base and not os.getenv("OPEN_METEO_CUSTOMER_BASE"):
+    os.environ["OPEN_METEO_CUSTOMER_BASE"] = customer_base
 
 if "selected_location" not in st.session_state:
     st.session_state.selected_location = DEFAULT_LOCATION.copy()
@@ -54,69 +47,80 @@ if "latitude_input" not in st.session_state:
 if "longitude_input" not in st.session_state:
     st.session_state.longitude_input = f"{float(st.session_state.selected_location['longitude']):.4f}"
 
-pending_location_sync = st.session_state.pop("pending_location_sync", None)
-if pending_location_sync is not None:
-    st.session_state.search_input = format_candidate(pending_location_sync)
-    st.session_state.latitude_input = f"{float(pending_location_sync['latitude']):.4f}"
-    st.session_state.longitude_input = f"{float(pending_location_sync['longitude']):.4f}"
+pending = st.session_state.pop("pending_location_sync", None)
+if pending:
+    st.session_state.search_input = format_candidate(pending)
+    st.session_state.latitude_input = f"{float(pending['latitude']):.4f}"
+    st.session_state.longitude_input = f"{float(pending['longitude']):.4f}"
 
 
-def queue_location_sync(location: dict) -> None:
+def sync_location(location: dict) -> None:
     st.session_state.pending_location_sync = location.copy()
 
 
 def search_and_select() -> None:
     query = st.session_state.search_input.strip()
     if not query:
+        st.warning("Lütfen bir konum adı yazın.")
         return
-    with st.spinner("Konum araniyor..."):
-        try:
+    try:
+        with st.spinner("Konum aranıyor..."):
             location = search_best_location(query)
-        except Exception as exc:
-            st.session_state.analysis_result = None
-            st.error(f"Konum aramasi sirasinda hata olustu: {exc}")
-            return
+    except Exception as exc:
+        st.error(f"Konum aranırken hata oluştu: {exc}")
+        return
     if location is None:
-        st.session_state.analysis_result = None
-        st.error("Bu isimle konum bulunamadi.")
+        st.error("Bu adla bir konum bulunamadı.")
         return
     st.session_state.selected_location = location
     st.session_state.analysis_result = None
-    queue_location_sync(location)
+    sync_location(location)
     st.rerun()
 
 
-def update_manual_coordinates() -> None:
+def update_coordinates() -> None:
     try:
         latitude = float(st.session_state.latitude_input)
         longitude = float(st.session_state.longitude_input)
     except (TypeError, ValueError):
-        st.error("Enlem ve boylam sayisal olmali.")
+        st.error("Enlem ve boylam sayısal olmalıdır.")
         return
     if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-        st.error("Enlem -90 ile 90, boylam -180 ile 180 arasinda olmali.")
+        st.error("Enlem −90–90, boylam −180–180 aralığında olmalıdır.")
         return
-    st.session_state.selected_location = {
-        "name": "Ozel koordinat",
+    location = {
+        "name": "Özel koordinat",
         "admin1": "",
         "country": "",
         "latitude": latitude,
         "longitude": longitude,
         "timezone": "auto",
     }
+    st.session_state.selected_location = location
     st.session_state.analysis_result = None
-    queue_location_sync(st.session_state.selected_location)
+    sync_location(location)
     st.rerun()
 
 
-def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    idf_rows = []
+def render_map(location: dict) -> None:
+    lat, lon = float(location["latitude"]), float(location["longitude"])
+    src = f"https://maps.google.com/maps?q={lat},{lon}&z=12&t=k&output=embed"
+    components.html(
+        f"""
+        <div style="height:245px;border:1px solid #d7e0df;border-radius:14px;overflow:hidden">
+          <iframe src="{src}" style="width:100%;height:100%;border:0" loading="lazy"></iframe>
+        </div>
+        """,
+        height=245,
+    )
+
+
+def analysis_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rows, diagnostics = [], []
     for duration in result["durations"]:
         row = {
-            "Sure (saat)": duration["duration"],
-            "Seri ort. (mm/saat)": duration["sampleMean"] / duration["duration"],
-            "Ornek sayisi": duration["sampleSize"],
-            "Secili parametre": duration["parameterText"],
+            "Süre (saat)": duration["duration"],
+            "Örnek sayısı": duration["sampleSize"],
         }
         for period, intensity, low, high in zip(
             result["returnPeriods"],
@@ -124,208 +128,185 @@ def analysis_to_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
             duration["intensityLower"],
             duration["intensityUpper"],
         ):
-            row[f"{period} yil"] = intensity
-            row[f"{period} yil alt"] = low
-            row[f"{period} yil ust"] = high
-        idf_rows.append(row)
-        for distribution_key, values in duration["fitDiagnostics"].items():
-            row[f"diag_{distribution_key}_rank"] = values["rank"]
-            row[f"diag_{distribution_key}_aic"] = values["aic"]
-            row[f"diag_{distribution_key}_ks"] = values["ks"]
-            row[f"diag_{distribution_key}_ad"] = values["ad"]
-    diagnostics_rows = []
-    for duration in result["durations"]:
+            row[f"{period} yıl (mm/saat)"] = intensity
+            row[f"{period} yıl alt"] = low
+            row[f"{period} yıl üst"] = high
+        rows.append(row)
         selected = duration["fitDiagnostics"][result["distribution"]]
-        diagnostics_rows.append(
+        diagnostics.append(
             {
-                "Sure (saat)": duration["duration"],
-                "Secili dagilim": DISTRIBUTIONS[result["distribution"]],
-                "Dagilim sirasi": selected["rank"],
+                "Süre (saat)": duration["duration"],
+                "Dağılım": DISTRIBUTIONS[result["distribution"]],
+                "Uyum sırası": selected["rank"],
                 "AIC": selected["aic"],
                 "KS": selected["ks"],
                 "KS p": selected["ksPValue"],
                 "AD": selected["ad"],
-                "Olay sayisi": duration["sampleSize"],
-                "Olay/yil": duration["seriesMeta"]["eventRate"],
+                "Olay sayısı": duration["sampleSize"],
             }
         )
-    return pd.DataFrame(idf_rows), pd.DataFrame(diagnostics_rows)
+    return pd.DataFrame(rows), pd.DataFrame(diagnostics)
 
 
-def result_to_csv_bytes(result: dict) -> bytes:
-    idf_df, diagnostics_df = analysis_to_frames(result)
+def chart_frame(result: dict) -> pd.DataFrame:
+    records = []
+    for duration in result["durations"]:
+        for period, central, low, high in zip(
+            result["returnPeriods"],
+            duration["intensities"],
+            duration["intensityLower"],
+            duration["intensityUpper"],
+        ):
+            records.append(
+                {
+                    "Süre (saat)": float(duration["duration"]),
+                    "Tekerrür dönemi": f"{period} yıl",
+                    "Şiddet (mm/saat)": central,
+                    "Alt sınır": low,
+                    "Üst sınır": high,
+                }
+            )
+    return pd.DataFrame(records)
+
+
+def chart_spec(data: pd.DataFrame) -> dict:
+    values = data.to_dict(orient="records")
+    return {
+        "data": {"values": values},
+        "width": "container",
+        "height": 410,
+        "layer": [
+            {
+                "mark": {"type": "line", "point": True, "strokeWidth": 2.5},
+                "encoding": {
+                    "x": {"field": "Süre (saat)", "type": "quantitative", "scale": {"type": "log"}},
+                    "y": {"field": "Şiddet (mm/saat)", "type": "quantitative"},
+                    "color": {"field": "Tekerrür dönemi", "type": "nominal"},
+                    "tooltip": [
+                        {"field": "Tekerrür dönemi", "type": "nominal"},
+                        {"field": "Süre (saat)", "type": "quantitative"},
+                        {"field": "Şiddet (mm/saat)", "type": "quantitative", "format": ".2f"},
+                        {"field": "Alt sınır", "type": "quantitative", "format": ".2f"},
+                        {"field": "Üst sınır", "type": "quantitative", "format": ".2f"},
+                    ],
+                },
+            }
+        ],
+    }
+
+
+def result_csv(result: dict) -> bytes:
+    idf_df, diagnostics_df = analysis_frames(result)
     buffer = io.StringIO()
-    meta = pd.DataFrame(
+    pd.DataFrame(
         [
             ["konum", format_candidate(result["location"])],
             ["enlem", result["location"]["latitude"]],
             ["boylam", result["location"]["longitude"]],
-            ["dagilim", result["distribution"]],
-            ["seri_turu", result["seriesMethod"]],
-            ["yagis_temeli", result["rainfallVariable"]],
-            ["guven_duzeyi", result["confidenceLevel"]],
-            ["baslangic_yili", result["startYear"]],
-            ["bitis_yili", result["endYear"]],
-            ["olusturma_zamani", result["generatedAt"]],
+            ["dağılım", DISTRIBUTIONS[result["distribution"]]],
+            ["seri_türü", result["seriesMethodLabel"]],
+            ["yağış_temeli", result["rainfallVariableLabel"]],
+            ["güven_düzeyi", result["confidenceLevel"]],
+            ["başlangıç_yılı", result["startYear"]],
+            ["bitiş_yılı", result["endYear"]],
         ],
-        columns=["alan", "deger"],
-    )
-    meta.to_csv(buffer, index=False)
+        columns=["alan", "değer"],
+    ).to_csv(buffer, index=False)
     buffer.write("\nIDF_TABLOSU\n")
     idf_df.to_csv(buffer, index=False)
-    buffer.write("\nDAGILIM_TANILARI\n")
+    buffer.write("\nDAĞILIM_TANILARI\n")
     diagnostics_df.to_csv(buffer, index=False)
-    return buffer.getvalue().encode("utf-8")
+    return buffer.getvalue().encode("utf-8-sig")
 
 
-def build_result_comment(result: dict) -> str:
-    durations = result["durations"]
-    ranks = [duration["fitDiagnostics"][result["distribution"]]["rank"] for duration in durations]
-    rank_one_count = sum(1 for rank in ranks if rank == 1)
-    sample_sizes = [duration["sampleSize"] for duration in durations]
-    widest_ratio = 0.0
-    for duration in durations:
-        for central, low, high in zip(duration["intensities"], duration["intensityLower"], duration["intensityUpper"]):
-            if central > 0:
-                widest_ratio = max(widest_ratio, (high - low) / central)
-    confidence_text = "dar" if widest_ratio < 0.35 else "orta" if widest_ratio < 0.75 else "genis"
-    rank_text = (
-        "Secili dagilim tum surelerde en iyi uyumlu aday."
-        if rank_one_count == len(durations)
-        else f"Secili dagilim {len(durations)} surenin {rank_one_count} tanesinde en iyi uyumu verdi."
-    )
-    return (
-        f"Bu tablo {result['seriesMethodLabel']} ve {result['rainfallVariableLabel'].lower()} uzerinden uretildi. "
-        f"Ornek buyuklugu {min(sample_sizes)}-{max(sample_sizes)} araliginda. "
-        f"{int(CONFIDENCE_LEVEL * 100)}% guven bandi genel olarak {confidence_text}. "
-        f"{rank_text}"
-    )
-
-
-def render_google_map(location: dict) -> None:
-    latitude = float(location["latitude"])
-    longitude = float(location["longitude"])
-    zoom = 12 if abs(latitude) < 55 else 10
-    src = f"https://maps.google.com/maps?q={latitude},{longitude}&z={zoom}&t=k&output=embed"
-    components.html(
-        f"""
-        <div style="position:relative;height:280px;border:1px solid #d6ddd5;border-radius:8px;overflow:hidden;background:#dfe6de;">
-          <iframe
-            src="{src}"
-            style="width:100%;height:100%;border:0;"
-            loading="lazy"
-            referrerpolicy="no-referrer-when-downgrade">
-          </iframe>
-          <div style="position:absolute;left:50%;top:50%;transform:translate(-50%, -80%);pointer-events:none;">
-            <div style="width:0;height:0;border-left:10px solid transparent;border-right:10px solid transparent;border-top:18px solid #c62828;filter:drop-shadow(0 2px 3px rgba(0,0,0,0.4));"></div>
-          </div>
-        </div>
-        """,
-        height=280,
-    )
+def quality_message(result: dict) -> tuple[str, str]:
+    years = int(result["yearsUsed"])
+    missing = int(result["missingHours"])
+    longest_period = int(result["returnPeriods"][-1])
+    if years < 20:
+        return "warning", "Kayıt süresi 20 yıldan kısa; uzun tekerrür dönemleri yüksek belirsizlik taşır."
+    if longest_period > years * 5:
+        return "warning", "En uzun tekerrür dönemi gözlem süresinin çok üzerindedir; sonuç ekstrapolasyondur."
+    if missing > years * 24 * 10:
+        return "warning", "Eksik saat sayısı yüksektir; veri kalite bölümünü kontrol edin."
+    return "success", "Kayıt uzunluğu temel ön değerlendirme için yeterli görünüyor."
 
 
 st.markdown(
     """
     <style>
-      .main { background: linear-gradient(180deg, rgba(221,233,235,0.55), rgba(246,247,242,0) 360px), #f6f7f2; }
-      .stApp { background: transparent; }
-      div[data-testid="stMetric"] { background: rgba(255,255,255,0.8); border: 1px solid #d6ddd5; border-radius: 8px; padding: 10px; }
-      .block-card { background: rgba(255,255,255,0.86); border: 1px solid #d6ddd5; border-radius: 8px; padding: 1rem; }
+    .stApp {background:linear-gradient(180deg,#edf5f4 0,#f8faf8 440px,#fff 100%)}
+    .block-container {padding-top:2.2rem;max-width:1500px}
+    div[data-testid="stMetric"] {background:#fff;border:1px solid #d9e4e2;border-radius:14px;padding:13px}
+    div[data-testid="stForm"] {background:rgba(255,255,255,.88);border:1px solid #d9e4e2;border-radius:16px;padding:1rem}
     </style>
     """,
     unsafe_allow_html=True,
 )
 
-st.title("Intensity-Duration-Frequency tablosu")
-st.caption("Streamlit backend + disk cache ile Open-Meteo destekli IDF analizi")
+st.title("🌧️ Tasarım Yağışı ve IDF Analizi")
+st.caption("Seçilen konum için farklı süre ve tekerrür dönemlerine ait tasarım yağışı şiddetlerini hesaplayın.")
 
-open_meteo_config = get_open_meteo_config()
+with st.expander("Veri kaynağı ve kullanım sınırı", expanded=False):
+    st.info(
+        "Bu uygulama Open-Meteo üzerinden yeniden analiz/model tabanlı yağış verisi kullanır. "
+        "Sonuçlar ön değerlendirme niteliğindedir; resmi istasyon IDF değerlerinin veya yerel kurum "
+        "tasarım kriterlerinin yerine geçmez."
+    )
 
-left, right = st.columns([1, 1.8], gap="large")
+left, right = st.columns([1, 1.75], gap="large")
 
 with left:
-    st.markdown('<div class="block-card">', unsafe_allow_html=True)
-    st.subheader("Girdi")
-    if open_meteo_config["use_customer_api"]:
-        st.success("Open-Meteo ticari API aktif")
-    else:
-        st.warning("Open-Meteo ucretsiz API aktif")
-    st.caption("API anahtari yalnizca Secrets/env uzerinden okunur.")
-
-    search_col, button_col = st.columns([4, 1])
+    st.subheader("1 · Konumu seçin")
+    search_col, search_button = st.columns([4, 1])
     with search_col:
-        st.text_input("Konum veya mekan adi", key="search_input", placeholder="Anitkabir, Galata Kulesi, Rize...")
-    with button_col:
+        st.text_input("Konum veya mekân adı", key="search_input", placeholder="Anıtkabir, Rize, Samsun...")
+    with search_button:
         st.write("")
         st.write("")
         if st.button("Ara", use_container_width=True):
             search_and_select()
 
-    selected = st.session_state.selected_location
-    coord_col1, coord_col2 = st.columns(2)
-    with coord_col1:
+    c1, c2, c3 = st.columns([1, 1, 0.8])
+    with c1:
         st.text_input("Enlem", key="latitude_input")
-    with coord_col2:
+    with c2:
         st.text_input("Boylam", key="longitude_input")
-    if st.button("Koordinati uygula", use_container_width=True):
-        update_manual_coordinates()
+    with c3:
+        st.write("")
+        st.write("")
+        if st.button("Uygula", use_container_width=True):
+            update_coordinates()
 
-    st.caption(f"Secili nokta: {format_candidate(st.session_state.selected_location)}")
-    st.caption(
-        f"Koordinat: {float(st.session_state.selected_location['latitude']):.4f}, "
-        f"{float(st.session_state.selected_location['longitude']):.4f}"
-    )
-    render_google_map(st.session_state.selected_location)
+    selected = st.session_state.selected_location
+    st.markdown(f"**Seçili nokta:** {format_candidate(selected)}")
+    st.caption(f"{float(selected['latitude']):.4f}, {float(selected['longitude']):.4f}")
+    render_map(selected)
 
-    year_col1, year_col2 = st.columns(2)
-    with year_col1:
-        start_year = st.number_input("Baslangic yili", min_value=1940, max_value=DEFAULT_END_YEAR, value=1995, step=1)
-    with year_col2:
-        end_year = st.number_input("Bitis yili", min_value=1940, max_value=DEFAULT_END_YEAR, value=DEFAULT_END_YEAR, step=1)
+    st.subheader("2 · Analiz ayarları")
+    y1, y2 = st.columns(2)
+    with y1:
+        start_year = st.number_input("Başlangıç yılı", 1940, DEFAULT_END_YEAR, 1995, 1)
+    with y2:
+        end_year = st.number_input("Bitiş yılı", 1940, DEFAULT_END_YEAR, DEFAULT_END_YEAR, 1)
 
-    distribution = st.selectbox(
-        "Dagilim",
-        options=list(DISTRIBUTIONS.keys()),
-        format_func=lambda key: DISTRIBUTIONS[key],
-    )
-    rainfall_variable = st.selectbox(
-        "Yagis temeli",
-        options=list(RAINFALL_VARIABLES.keys()),
-        format_func=lambda key: RAINFALL_VARIABLES[key],
-    )
-    series_method = st.selectbox(
-        "Seri tipi",
-        options=list(SERIES_METHODS.keys()),
-        format_func=lambda key: SERIES_METHODS[key],
-    )
-    pds_percentile = DEFAULT_PDS_PERCENTILE
-    pds_gap_hours = DEFAULT_PDS_GAP_HOURS
-    if series_method == "pds":
-        pds_col1, pds_col2 = st.columns(2)
-        with pds_col1:
-            pds_percentile = st.number_input(
-                "PDS esik yuzdesi",
-                min_value=90.0,
-                max_value=99.9,
-                value=DEFAULT_PDS_PERCENTILE,
-                step=0.5,
-            )
-        with pds_col2:
-            pds_gap_hours = st.number_input(
-                "Bagimsiz olay araligi",
-                min_value=6,
-                max_value=240,
-                value=DEFAULT_PDS_GAP_HOURS,
-                step=6,
-            )
-    st.caption(
-        "Cache anahtari: konum + yil araligi + dagilim + seri tipi. "
-        "Ham Open-Meteo parcaciklari da diskte tutulur."
-    )
+    distribution = list(DISTRIBUTIONS.keys())[0]
+    rainfall_variable = list(RAINFALL_VARIABLES.keys())[0]
+    series_method = list(SERIES_METHODS.keys())[0]
+    pds_percentile, pds_gap_hours = DEFAULT_PDS_PERCENTILE, DEFAULT_PDS_GAP_HOURS
 
-    calculate_clicked = st.button("Tabloyu hesapla", type="primary", use_container_width=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    with st.expander("Gelişmiş ayarlar"):
+        distribution = st.selectbox("İstatistiksel dağılım", list(DISTRIBUTIONS), format_func=DISTRIBUTIONS.get)
+        rainfall_variable = st.selectbox("Yağış temeli", list(RAINFALL_VARIABLES), format_func=RAINFALL_VARIABLES.get)
+        series_method = st.selectbox("Seri tipi", list(SERIES_METHODS), format_func=SERIES_METHODS.get)
+        if series_method == "pds":
+            p1, p2 = st.columns(2)
+            with p1:
+                pds_percentile = st.number_input("PDS eşik yüzdesi", 90.0, 99.9, DEFAULT_PDS_PERCENTILE, 0.5)
+            with p2:
+                pds_gap_hours = st.number_input("Bağımsız olay aralığı (saat)", 6, 240, DEFAULT_PDS_GAP_HOURS, 6)
+
+    calculate_clicked = st.button("Analizi hesapla", type="primary", use_container_width=True)
 
 with right:
     status_box = st.empty()
@@ -333,62 +314,80 @@ with right:
 if calculate_clicked:
     minimum_years = 8 if series_method == "ams" else 5
     if start_year > end_year:
-        st.error("Baslangic yili bitis yilindan buyuk olamaz.")
+        st.error("Başlangıç yılı bitiş yılından büyük olamaz.")
     elif end_year - start_year + 1 < minimum_years:
-        st.error(f"{SERIES_METHODS[series_method]} icin en az {minimum_years} yillik seri secin.")
+        st.error(f"{SERIES_METHODS[series_method]} için en az {minimum_years} yıllık seri seçin.")
     else:
-        progress = status_box.progress(0, text="Analiz baslatiliyor...")
+        progress = status_box.progress(0, text="Analiz başlatılıyor...")
 
         def report_progress(message: str, ratio: float) -> None:
             progress.progress(min(max(ratio, 0.0), 1.0), text=message)
 
         try:
-            with st.spinner("Open-Meteo verileri okunuyor..."):
-                result = calculate_analysis(
-                    st.session_state.selected_location,
-                    int(start_year),
-                    int(end_year),
-                    distribution,
-                    rainfall_variable=rainfall_variable,
-                    series_method=series_method,
-                    pds_percentile=float(pds_percentile),
-                    pds_gap_hours=int(pds_gap_hours),
-                    progress_callback=report_progress,
-                )
+            result = calculate_analysis(
+                st.session_state.selected_location,
+                int(start_year),
+                int(end_year),
+                distribution,
+                rainfall_variable=rainfall_variable,
+                series_method=series_method,
+                pds_percentile=float(pds_percentile),
+                pds_gap_hours=int(pds_gap_hours),
+                progress_callback=report_progress,
+            )
         except Exception as exc:
             st.session_state.analysis_result = None
             status_box.empty()
             st.error(str(exc))
         else:
             st.session_state.analysis_result = result
-            progress.progress(1.0, text="Hazir")
+            progress.progress(1.0, text="Analiz hazır")
 
 result = st.session_state.analysis_result
-
 with right:
     if result is None:
-        st.info("Sonuc burada gosterilecek. Konumu secip hesaplamayi baslatin.")
+        st.info("Konumu ve analiz dönemini seçip **Analizi hesapla** düğmesine basın.")
     else:
-        metric1, metric2, metric3, metric4 = st.columns(4)
-        metric1.metric("Veri kapsami", f"{result['yearsUsed']} yil")
-        metric2.metric("Eksik saat", f"{result['missingHours']:,}".replace(",", "."))
-        metric3.metric("Yinelenme", f"{RETURN_PERIODS[0]}-{RETURN_PERIODS[-1]} yil")
-        metric4.metric("Seri tipi", result["seriesMethod"].upper())
+        st.subheader("3 · Sonuçlar")
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Veri dönemi", f"{result['startYear']}–{result['endYear']}")
+        m2.metric("Kullanılan kayıt", f"{result['yearsUsed']} yıl")
+        m3.metric("Tekerrür aralığı", f"{RETURN_PERIODS[0]}–{RETURN_PERIODS[-1]} yıl")
+        m4.metric("Seri tipi", result["seriesMethod"].upper())
 
-        idf_df, diagnostics_df = analysis_to_frames(result)
+        level, message = quality_message(result)
+        getattr(st, level)(message)
+        tabs = st.tabs(["IDF eğrileri", "Yağış tablosu", "İstatistiksel uygunluk", "Veri kalitesi", "İndir"])
+        idf_df, diagnostics_df = analysis_frames(result)
 
-        st.caption(
-            f"Secili dagilim: {DISTRIBUTIONS[result['distribution']]} | "
-            f"Yagis temeli: {result['rainfallVariableLabel']} | "
-            f"{int(CONFIDENCE_LEVEL * 100)}% bootstrap guven araligi"
-        )
-        st.info(build_result_comment(result))
-        st.dataframe(idf_df.round(3), use_container_width=True, hide_index=True)
+        with tabs[0]:
+            st.markdown("#### Yağış şiddeti–süre–tekerrür eğrileri")
+            st.caption(f"Çizgiler merkezi tahmini gösterir. Hesaplanan güven düzeyi: %{int(CONFIDENCE_LEVEL * 100)}.")
+            st.vega_lite_chart(chart_spec(chart_frame(result)), use_container_width=True)
 
-        st.download_button(
-            "CSV indir",
-            data=result_to_csv_bytes(result),
-            file_name=f"idf-{result['distribution']}-{result['startYear']}-{result['endYear']}.csv",
-            mime="text/csv",
-            use_container_width=False,
-        )
+        with tabs[1]:
+            st.dataframe(idf_df.round(3), use_container_width=True, hide_index=True)
+
+        with tabs[2]:
+            st.caption("Daha düşük AIC ve yüksek uyum sırası, aday dağılımın göreli başarısını gösterir.")
+            st.dataframe(diagnostics_df.round(4), use_container_width=True, hide_index=True)
+
+        with tabs[3]:
+            q1, q2, q3 = st.columns(3)
+            q1.metric("Kullanılan yıl", result["yearsUsed"])
+            q2.metric("Eksik saat", f"{result['missingHours']:,}".replace(",", "."))
+            q3.metric("Güven bandı", f"%{int(CONFIDENCE_LEVEL * 100)}")
+            st.warning(
+                "Uzun tekerrür dönemleri gözlem süresinin ötesine istatistiksel ekstrapolasyondur. "
+                "Kritik altyapı tasarımında resmi istasyon kayıtları ve kurum kriterleriyle doğrulayın."
+            )
+
+        with tabs[4]:
+            st.download_button(
+                "CSV raporunu indir",
+                data=result_csv(result),
+                file_name=f"idf-{result['distribution']}-{result['startYear']}-{result['endYear']}.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
