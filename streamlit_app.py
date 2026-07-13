@@ -242,6 +242,21 @@ def chart_frame(result: dict) -> pd.DataFrame:
                     "Tahmin türü": "Alt-saatlik ekstrapolasyon",
                 }
             )
+        one_hour_central = next((value for duration, value in point_sets["central"] if duration == 1.0), None)
+        one_hour_low = next((value for duration, value in point_sets["low"] if duration == 1.0), None)
+        one_hour_high = next((value for duration, value in point_sets["high"] if duration == 1.0), None)
+        if one_hour_central is not None and one_hour_low is not None and one_hour_high is not None:
+            records.append(
+                {
+                    "Süre (saat)": 1.0,
+                    "Süre etiketi": "1 saat bağlantı noktası",
+                    "Tekerrür dönemi": f"{period} yıl",
+                    "Şiddet (mm/saat)": one_hour_central,
+                    "Alt sınır": one_hour_low,
+                    "Üst sınır": one_hour_high,
+                    "Tahmin türü": "Alt-saatlik ekstrapolasyon",
+                }
+            )
     return pd.DataFrame(records)
 
 
