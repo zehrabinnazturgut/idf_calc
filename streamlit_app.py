@@ -8,14 +8,12 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from streamlit_backend import (
-    ANALYSIS_METHODS,
     CONFIDENCE_LEVEL,
     DEFAULT_END_YEAR,
     DEFAULT_LOCATION,
     DEFAULT_PDS_GAP_HOURS,
     DEFAULT_PDS_PERCENTILE,
     DISTRIBUTIONS,
-    MGM_DISTRIBUTIONS,
     RAINFALL_VARIABLES,
     RETURN_PERIODS,
     SERIES_METHODS,
@@ -23,6 +21,18 @@ from streamlit_backend import (
     format_candidate,
     search_best_location,
 )
+
+ANALYSIS_METHODS = {
+    "mgm_compatible": "MGM uyumlu frekans analizi",
+    "extended": "Genişletilmiş istatistiksel analiz",
+}
+MGM_DISTRIBUTIONS = {
+    "ln2": "Log-Normal 2P",
+    "ln3": "Log-Normal 3P",
+    "gamma2": "Gama 2P",
+    "lp3": "Log-Pearson III",
+    "gumbel": "Gumbel",
+}
 
 
 st.set_page_config(page_title="Tasarım Yağışı ve IDF Analizi", page_icon="🌧️", layout="wide")
@@ -426,4 +436,3 @@ with right:
                 mime="text/csv",
                 use_container_width=True,
             )
-
