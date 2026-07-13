@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import math
 import os
 
 import pandas as pd
@@ -167,8 +168,41 @@ def analysis_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
     return pd.DataFrame(rows), pd.DataFrame(diagnostics)
 
 
+SUBHOURLY_MINUTES = [5, 10, 15, 20, 25, 30]
+
+
+def fit_duration_curve(points: list[tuple[float, float]]) -> tuple[float, float, float]:
+    """Fit i=a/(d+b)^c with a small deterministic grid search for b."""
+    valid = [(float(d), float(i)) for d, i in points if d > 0 and i > 0]
+    if len(valid) < 2:
+        return 0.0, 0.0, 1.0
+    best = (float("inf"), 0.0, 0.0, 1.0)
+    for step in range(0, 101):
+        b_value = step / 100.0
+        xs = [math.log(duration + b_value) for duration, _ in valid]
+        ys = [math.log(intensity) for _, intensity in valid]
+        x_avg = sum(xs) / len(xs)
+        y_avg = sum(ys) / len(ys)
+        denominator = sum((value - x_avg) ** 2 for value in xs)
+        if denominator <= 0:
+            continue
+        slope = sum((x - x_avg) * (y - y_avg) for x, y in zip(xs, ys)) / denominator
+        c_value = max(-slope, 0.01)
+        log_a = y_avg + c_value * x_avg
+        error = sum((y - (log_a - c_value * x)) ** 2 for x, y in zip(xs, ys))
+        if error < best[0]:
+            best = (error, math.exp(log_a), b_value, c_value)
+    return best[1], best[2], best[3]
+
+
+def curve_value(parameters: tuple[float, float, float], duration: float) -> float:
+    a_value, b_value, c_value = parameters
+    return a_value / max(duration + b_value, 1e-9) ** c_value
+
+
 def chart_frame(result: dict) -> pd.DataFrame:
     records = []
+    period_points: dict[int, dict[str, list[tuple[float, float]]]] = {}
     for duration in result["durations"]:
         for period, central, low, high in zip(
             result["returnPeriods"],
@@ -183,6 +217,29 @@ def chart_frame(result: dict) -> pd.DataFrame:
                     "Şiddet (mm/saat)": central,
                     "Alt sınır": low,
                     "Üst sınır": high,
+                    "Tahmin türü": "Saatlik veriden doğrudan hesap",
+                }
+            )
+            points = period_points.setdefault(period, {"central": [], "low": [], "high": []})
+            points["central"].append((float(duration["duration"]), central))
+            points["low"].append((float(duration["duration"]), low))
+            points["high"].append((float(duration["duration"]), high))
+
+    for period, point_sets in period_points.items():
+        central_fit = fit_duration_curve(point_sets["central"])
+        low_fit = fit_duration_curve(point_sets["low"])
+        high_fit = fit_duration_curve(point_sets["high"])
+        for minutes in SUBHOURLY_MINUTES:
+            duration_hours = minutes / 60.0
+            records.append(
+                {
+                    "Süre (saat)": duration_hours,
+                    "Süre etiketi": f"{minutes} dk",
+                    "Tekerrür dönemi": f"{period} yıl",
+                    "Şiddet (mm/saat)": curve_value(central_fit, duration_hours),
+                    "Alt sınır": curve_value(low_fit, duration_hours),
+                    "Üst sınır": curve_value(high_fit, duration_hours),
+                    "Tahmin türü": "Alt-saatlik ekstrapolasyon",
                 }
             )
     return pd.DataFrame(records)
@@ -202,10 +259,15 @@ def chart_spec(data: pd.DataFrame) -> dict:
                     "y": {"field": "Alt sınır", "type": "quantitative", "title": "Şiddet (mm/saat)"},
                     "y2": {"field": "Üst sınır"},
                     "color": {"field": "Tekerrür dönemi", "type": "nominal"},
-                    "detail": {"field": "Tekerrür dönemi", "type": "nominal"},
+                    "detail": [
+                        {"field": "Tekerrür dönemi", "type": "nominal"},
+                        {"field": "Tahmin türü", "type": "nominal"},
+                    ],
                     "tooltip": [
                         {"field": "Tekerrür dönemi", "type": "nominal"},
                         {"field": "Süre (saat)", "type": "quantitative"},
+                        {"field": "Süre etiketi", "type": "nominal"},
+                        {"field": "Tahmin türü", "type": "nominal"},
                         {"field": "Alt sınır", "type": "quantitative", "format": ".2f"},
                         {"field": "Üst sınır", "type": "quantitative", "format": ".2f"},
                     ],
@@ -217,9 +279,20 @@ def chart_spec(data: pd.DataFrame) -> dict:
                     "x": {"field": "Süre (saat)", "type": "quantitative", "scale": {"type": "log"}},
                     "y": {"field": "Şiddet (mm/saat)", "type": "quantitative"},
                     "color": {"field": "Tekerrür dönemi", "type": "nominal"},
+                    "strokeDash": {
+                        "field": "Tahmin türü",
+                        "type": "nominal",
+                        "scale": {
+                            "domain": ["Saatlik veriden doğrudan hesap", "Alt-saatlik ekstrapolasyon"],
+                            "range": [[1, 0], [7, 5]],
+                        },
+                    },
+                    "detail": {"field": "Tekerrür dönemi", "type": "nominal"},
                     "tooltip": [
                         {"field": "Tekerrür dönemi", "type": "nominal"},
                         {"field": "Süre (saat)", "type": "quantitative"},
+                        {"field": "Süre etiketi", "type": "nominal"},
+                        {"field": "Tahmin türü", "type": "nominal"},
                         {"field": "Şiddet (mm/saat)", "type": "quantitative", "format": ".2f"},
                         {"field": "Alt sınır", "type": "quantitative", "format": ".2f"},
                         {"field": "Üst sınır", "type": "quantitative", "format": ".2f"},
@@ -421,6 +494,10 @@ with right:
 
         with tabs[0]:
             st.markdown("#### Yağış şiddeti–süre–tekerrür eğrileri")
+            st.warning(
+                "5, 10, 15, 20, 25 ve 30 dakikalık değerler, saatlik ERA5 verisinden doğrudan ölçülmemiştir. "
+                "Saatlik IDF sonuçlarına uydurulan i=a/(d+b)^c eğrisinden ekstrapole edilmiş ve kesikli çizgiyle gösterilmiştir."
+            )
             st.caption(
                 f"Çizgiler merkezi tahmini, yarı saydam alanlar %{int(CONFIDENCE_LEVEL * 100)} "
                 "bootstrap güven aralığını gösterir."
