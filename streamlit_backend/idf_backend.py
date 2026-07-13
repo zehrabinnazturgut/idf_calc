@@ -16,6 +16,17 @@ DISTRIBUTIONS = {
     "gumbel": "Gumbel",
     "gev": "GEV",
 }
+MGM_DISTRIBUTIONS = {
+    "ln2": "Log-Normal 2P",
+    "ln3": "Log-Normal 3P",
+    "gamma2": "Gama 2P",
+    "lp3": "Log-Pearson III",
+    "gumbel": "Gumbel",
+}
+ANALYSIS_METHODS = {
+    "mgm_compatible": "MGM uyumlu frekans analizi",
+    "extended": "Genişletilmiş istatistiksel analiz",
+}
 SERIES_METHODS = {
     "ams": "Annual Maximum Series",
     "pds": "Partial Duration Series",
@@ -35,6 +46,7 @@ RUNOFF_VARIABLES = [
     "soil_moisture_100_to_255cm",
 ]
 DURATIONS = [1, 2, 3, 6, 12, 24]
+MGM_DURATIONS = [1, 2, 3, 4, 5, 6, 8, 12, 18, 24]
 RETURN_PERIODS = [2, 5, 10, 25, 50, 100]
 ARCHIVE_CHUNK_YEARS = 12
 DEFAULT_END_YEAR = 2025
@@ -203,6 +215,7 @@ def calculate_analysis(
     pds_gap_hours: int = DEFAULT_PDS_GAP_HOURS,
     bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
     progress_callback: Callable[[str, float], None] | None = None,
+    analysis_method: str = "extended",
 ) -> dict[str, Any]:
     query_key = {
         "lat": round(float(location["latitude"]), 4),
@@ -210,6 +223,7 @@ def calculate_analysis(
         "start_year": int(start_year),
         "end_year": int(end_year),
         "distribution": distribution,
+        "analysis_method": analysis_method,
         "rainfall_variable": rainfall_variable,
         "series_method": series_method,
         "pds_percentile": round(float(pds_percentile), 3),
@@ -238,6 +252,7 @@ def calculate_analysis(
         pds_gap_hours=pds_gap_hours,
         bootstrap_samples=bootstrap_samples,
         progress_callback=progress_callback,
+        analysis_method=analysis_method,
     )
     _cache_write("analysis", query_key, result)
     return result
@@ -343,13 +358,23 @@ def build_analysis(
     pds_gap_hours: int = DEFAULT_PDS_GAP_HOURS,
     bootstrap_samples: int = DEFAULT_BOOTSTRAP_SAMPLES,
     progress_callback: Callable[[str, float], None] | None = None,
+    analysis_method: str = "extended",
 ) -> dict[str, Any]:
+    if analysis_method not in ANALYSIS_METHODS:
+        raise ValueError("Bilinmeyen hesap yöntemi.")
+    if analysis_method == "mgm_compatible":
+        series_method = "ams"
+        durations_to_use = MGM_DURATIONS
+        candidate_distributions = MGM_DISTRIBUTIONS
+    else:
+        durations_to_use = DURATIONS
+        candidate_distributions = DISTRIBUTIONS
     durations = []
-    for duration_index, duration in enumerate(DURATIONS):
+    for duration_index, duration in enumerate(durations_to_use):
         if progress_callback:
             progress_callback(
                 f"{duration} saat icin frekans analizi",
-                0.96 + 0.04 * ((duration_index + 1) / max(len(DURATIONS), 1)),
+                0.96 + 0.04 * ((duration_index + 1) / max(len(durations_to_use), 1)),
             )
         events, extraction_meta = extract_duration_records(
             yearly_series=yearly_series,
@@ -363,8 +388,13 @@ def build_analysis(
         minimum_samples = 8 if series_method == "ams" else 12
         if len(maxima) < minimum_samples:
             raise RuntimeError(f"{duration} saat suresi icin yeterli bagimsiz olay olusmadi.")
-        fit_diagnostics = compare_distributions(maxima)
-        selected_fit = fit_diagnostics[distribution]
+        fit_diagnostics = compare_distributions(maxima, candidate_distributions)
+        selected_distribution = (
+            select_mgm_distribution(fit_diagnostics)
+            if analysis_method == "mgm_compatible"
+            else distribution
+        )
+        selected_fit = fit_diagnostics[selected_distribution]
         nonexceedance_probabilities = [
             probability_for_return_period(return_period, extraction_meta["event_rate"], series_method)
             for return_period in RETURN_PERIODS
@@ -372,7 +402,7 @@ def build_analysis(
         depths = [quantile_from_fit(selected_fit, probability) for probability in nonexceedance_probabilities]
         lower_depths, upper_depths = bootstrap_confidence_intervals(
             samples=maxima,
-            distribution=distribution,
+            distribution=selected_distribution,
             probabilities=nonexceedance_probabilities,
             bootstrap_samples=bootstrap_samples,
         )
@@ -390,6 +420,8 @@ def build_analysis(
                 "sampleMax": max(maxima),
                 "sampleSize": len(maxima),
                 "parameterText": selected_fit["parameterText"],
+                "selectedDistribution": selected_distribution,
+                "selectedDistributionLabel": candidate_distributions[selected_distribution],
                 "fitDiagnostics": fit_diagnostics,
                 "seriesMeta": extraction_meta,
                 "runoffSummary": summarize_runoff_drivers(events, duration),
@@ -399,6 +431,10 @@ def build_analysis(
     return {
         "location": location,
         "distribution": distribution,
+        "analysisMethod": analysis_method,
+        "analysisMethodLabel": ANALYSIS_METHODS[analysis_method],
+        "dataSourceLabel": "Open-Meteo ERA5 saatlik yeniden analiz",
+        "isOfficialMgmResult": False,
         "rainfallVariable": rainfall_variable,
         "rainfallVariableLabel": RAINFALL_VARIABLES.get(rainfall_variable, rainfall_variable),
         "seriesMethod": series_method,
@@ -646,16 +682,24 @@ def average_numbers(values: list[float | None]) -> float | None:
     return sum(samples) / len(samples) if samples else None
 
 
-def compare_distributions(samples: list[float]) -> dict[str, dict[str, Any]]:
+def compare_distributions(
+    samples: list[float],
+    candidates: dict[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
     diagnostics = {}
-    for distribution in DISTRIBUTIONS:
+    for distribution in (candidates or DISTRIBUTIONS):
         fit = fit_distribution(samples, distribution)
+        ks_value = calculate_ks_statistic(samples, fit)
+        chi_square, chi_df, chi_p = calculate_chi_square_test(samples, fit)
         diagnostics[distribution] = {
             **fit,
             "aic": calculate_aic(samples, fit),
-            "ks": calculate_ks_statistic(samples, fit),
-            "ksPValue": ks_p_value(len(samples), calculate_ks_statistic(samples, fit)),
+            "ks": ks_value,
+            "ksPValue": ks_p_value(len(samples), ks_value),
             "ad": calculate_ad_statistic(samples, fit),
+            "chiSquare": chi_square,
+            "chiSquareDf": chi_df,
+            "chiSquarePValue": chi_p,
         }
     ranked = sorted(diagnostics.items(), key=lambda item: (item[1]["aic"], item[1]["ks"], item[1]["ad"]))
     for index, (distribution, values) in enumerate(ranked, start=1):
@@ -664,7 +708,45 @@ def compare_distributions(samples: list[float]) -> dict[str, dict[str, Any]]:
     return diagnostics
 
 
+def select_mgm_distribution(diagnostics: dict[str, dict[str, Any]]) -> str:
+    """Select the best candidate using MGM's KS and chi-square goodness-of-fit family."""
+    ranked = sorted(
+        diagnostics.items(),
+        key=lambda item: (
+            not (item[1]["ksPValue"] >= 0.05 and item[1]["chiSquarePValue"] >= 0.05),
+            item[1]["ks"],
+            item[1]["chiSquare"] / max(item[1]["chiSquareDf"], 1),
+            item[1]["aic"],
+        ),
+    )
+    return ranked[0][0]
+
+
 def fit_distribution(samples: list[float], distribution: str) -> dict[str, Any]:
+    if distribution == "ln2":
+        parameters = fit_lognormal_2p(samples)
+        return {
+            "distribution": distribution,
+            "parameters": parameters,
+            "parameterText": f"mu {parameters['mu']:.3f}, sigma {parameters['sigma']:.3f}",
+            "parameterCount": 2,
+        }
+    if distribution == "ln3":
+        parameters = fit_lognormal_3p(samples)
+        return {
+            "distribution": distribution,
+            "parameters": parameters,
+            "parameterText": f"theta {parameters['location']:.2f}, mu {parameters['mu']:.3f}, sigma {parameters['sigma']:.3f}",
+            "parameterCount": 3,
+        }
+    if distribution == "gamma2":
+        parameters = fit_gamma_2p(samples)
+        return {
+            "distribution": distribution,
+            "parameters": parameters,
+            "parameterText": f"alpha {parameters['shape']:.3f}, beta {parameters['scale']:.3f}",
+            "parameterCount": 2,
+        }
     if distribution == "gumbel":
         parameters = fit_gumbel(samples)
         return {
@@ -706,6 +788,11 @@ def quantile_from_fit(fit: dict[str, Any], probability: float) -> float:
     distribution = fit["distribution"]
     parameters = fit["parameters"]
     probability = clamp(probability, 1e-6, 1 - 1e-6)
+    if distribution in {"ln2", "ln3"}:
+        location = parameters.get("location", 0.0)
+        return location + math.exp(parameters["mu"] + parameters["sigma"] * inverse_normal(probability))
+    if distribution == "gamma2":
+        return parameters["scale"] * inverse_regularized_gamma_p(parameters["shape"], probability)
     if distribution == "gumbel":
         return gumbel_quantile(probability, parameters["location"], parameters["scale"])
     if distribution == "gev":
@@ -775,6 +862,16 @@ def bootstrap_confidence_intervals(
 def cdf_value(fit: dict[str, Any], sample: float) -> float:
     distribution = fit["distribution"]
     parameters = fit["parameters"]
+    if distribution in {"ln2", "ln3"}:
+        shifted = sample - parameters.get("location", 0.0)
+        if shifted <= 0:
+            return 0.0
+        z_value = (math.log(shifted) - parameters["mu"]) / max(parameters["sigma"], 1e-12)
+        return 0.5 * (1 + math.erf(z_value / math.sqrt(2)))
+    if distribution == "gamma2":
+        if sample <= 0:
+            return 0.0
+        return regularized_gamma_p(parameters["shape"], sample / parameters["scale"])
     if distribution == "gumbel":
         z_value = (sample - parameters["location"]) / max(parameters["scale"], 1e-12)
         return math.exp(-math.exp(-z_value))
@@ -787,12 +884,80 @@ def log_pdf(fit: dict[str, Any], sample: float) -> float:
     distribution = fit["distribution"]
     parameters = fit["parameters"]
     sample = max(sample, 1e-12)
+    if distribution in {"ln2", "ln3"}:
+        shifted = sample - parameters.get("location", 0.0)
+        if shifted <= 0:
+            return float("-inf")
+        sigma = max(parameters["sigma"], 1e-12)
+        z_value = (math.log(shifted) - parameters["mu"]) / sigma
+        return -math.log(shifted * sigma * math.sqrt(2 * math.pi)) - 0.5 * z_value * z_value
+    if distribution == "gamma2":
+        shape, scale = parameters["shape"], parameters["scale"]
+        return (shape - 1) * math.log(sample) - sample / scale - log_gamma(shape) - shape * math.log(scale)
     if distribution == "gumbel":
         z_value = (sample - parameters["location"]) / max(parameters["scale"], 1e-12)
         return -math.log(max(parameters["scale"], 1e-12)) - z_value - math.exp(-z_value)
     if distribution == "gev":
         return gev_log_pdf(sample, parameters["location"], parameters["scale"], parameters["shape"])
     return lp3_log_pdf(sample, parameters)
+
+
+def fit_lognormal_2p(samples: list[float]) -> dict[str, float]:
+    logs = [math.log(max(value, 1e-12)) for value in samples]
+    return {"mu": mean(logs), "sigma": max(standard_deviation(logs), 1e-6), "location": 0.0}
+
+
+def fit_lognormal_3p(samples: list[float]) -> dict[str, float]:
+    avg = mean(samples)
+    sd = max(standard_deviation(samples), 1e-6)
+    sample_skew = max(skewness(samples), 1e-6)
+
+    def theoretical_skew(sigma: float) -> float:
+        variance_factor = math.exp(sigma * sigma) - 1
+        return (variance_factor + 3) * math.sqrt(max(variance_factor, 0.0))
+
+    low, high = 1e-6, 3.0
+    for _ in range(80):
+        mid = (low + high) / 2
+        if theoretical_skew(mid) < sample_skew:
+            low = mid
+        else:
+            high = mid
+    sigma = max((low + high) / 2, 1e-6)
+    mean_shifted = sd / math.sqrt(max(math.exp(sigma * sigma) - 1, 1e-12))
+    location = avg - mean_shifted
+    if location >= min(samples):
+        location = min(samples) - max(abs(min(samples)) * 1e-6, 1e-6)
+        shifted_logs = [math.log(max(value - location, 1e-12)) for value in samples]
+        return {"mu": mean(shifted_logs), "sigma": max(standard_deviation(shifted_logs), 1e-6), "location": location}
+    mu = math.log(max(mean_shifted, 1e-12)) - 0.5 * sigma * sigma
+    return {"mu": mu, "sigma": sigma, "location": location}
+
+
+def fit_gamma_2p(samples: list[float]) -> dict[str, float]:
+    avg = max(mean(samples), 1e-12)
+    variance = max(standard_deviation(samples) ** 2, 1e-12)
+    return {"shape": max(avg * avg / variance, 1e-6), "scale": max(variance / avg, 1e-6)}
+
+
+def calculate_chi_square_test(samples: list[float], fit: dict[str, Any]) -> tuple[float, int, float]:
+    n = len(samples)
+    bin_count = min(8, max(fit["parameterCount"] + 2, n // 5))
+    bin_count = min(bin_count, max(n, 1))
+    if bin_count <= fit["parameterCount"] + 1:
+        return float("inf"), 1, 0.0
+    edges = [quantile_from_fit(fit, index / bin_count) for index in range(1, bin_count)]
+    observed = [0] * bin_count
+    for sample in samples:
+        index = 0
+        while index < len(edges) and sample > edges[index]:
+            index += 1
+        observed[index] += 1
+    expected = n / bin_count
+    statistic = sum((count - expected) ** 2 / max(expected, 1e-12) for count in observed)
+    degrees = max(bin_count - 1 - fit["parameterCount"], 1)
+    p_value = clamp(1 - regularized_gamma_p(degrees / 2, statistic / 2), 0.0, 1.0)
+    return statistic, degrees, p_value
 
 
 def fit_gumbel(samples: list[float]) -> dict[str, float]:
