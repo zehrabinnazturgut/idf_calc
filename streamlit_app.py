@@ -8,12 +8,14 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from streamlit_backend import (
+    ANALYSIS_METHODS,
     CONFIDENCE_LEVEL,
     DEFAULT_END_YEAR,
     DEFAULT_LOCATION,
     DEFAULT_PDS_GAP_HOURS,
     DEFAULT_PDS_PERCENTILE,
     DISTRIBUTIONS,
+    MGM_DISTRIBUTIONS,
     RAINFALL_VARIABLES,
     RETURN_PERIODS,
     SERIES_METHODS,
@@ -132,16 +134,23 @@ def analysis_frames(result: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
             row[f"{period} yıl alt"] = low
             row[f"{period} yıl üst"] = high
         rows.append(row)
-        selected = duration["fitDiagnostics"][result["distribution"]]
+        selected_key = duration.get("selectedDistribution", result["distribution"])
+        selected = duration["fitDiagnostics"][selected_key]
         diagnostics.append(
             {
                 "Süre (saat)": duration["duration"],
-                "Dağılım": DISTRIBUTIONS[result["distribution"]],
+                "Dağılım": duration.get(
+                    "selectedDistributionLabel",
+                    DISTRIBUTIONS.get(selected_key, MGM_DISTRIBUTIONS.get(selected_key, selected_key)),
+                ),
                 "Uyum sırası": selected["rank"],
                 "AIC": selected["aic"],
                 "KS": selected["ks"],
                 "KS p": selected["ksPValue"],
                 "AD": selected["ad"],
+                "Khi-kare": selected.get("chiSquare"),
+                "Khi-kare sd": selected.get("chiSquareDf"),
+                "Khi-kare p": selected.get("chiSquarePValue"),
                 "Olay sayısı": duration["sampleSize"],
             }
         )
@@ -284,6 +293,16 @@ with left:
     render_map(selected)
 
     st.subheader("2 · Analiz ayarları")
+    analysis_method = st.radio(
+        "Hesap yöntemi",
+        options=list(ANALYSIS_METHODS),
+        format_func=ANALYSIS_METHODS.get,
+        horizontal=True,
+        help=(
+            "MGM uyumlu yöntem, Open-Meteo ERA5 saatlik verisine MGM'nin yıllık maksimum, "
+            "standart saatlik süre, aday dağılım ve uygunluk seçimi yaklaşımını uygular."
+        ),
+    )
     y1, y2 = st.columns(2)
     with y1:
         start_year = st.number_input("Başlangıç yılı", 1940, DEFAULT_END_YEAR, 1995, 1)
@@ -296,10 +315,17 @@ with left:
     pds_percentile, pds_gap_hours = DEFAULT_PDS_PERCENTILE, DEFAULT_PDS_GAP_HOURS
 
     with st.expander("Gelişmiş ayarlar"):
-        distribution = st.selectbox("İstatistiksel dağılım", list(DISTRIBUTIONS), format_func=DISTRIBUTIONS.get)
         rainfall_variable = st.selectbox("Yağış temeli", list(RAINFALL_VARIABLES), format_func=RAINFALL_VARIABLES.get)
-        series_method = st.selectbox("Seri tipi", list(SERIES_METHODS), format_func=SERIES_METHODS.get)
-        if series_method == "pds":
+        if analysis_method == "extended":
+            distribution = st.selectbox("İstatistiksel dağılım", list(DISTRIBUTIONS), format_func=DISTRIBUTIONS.get)
+            series_method = st.selectbox("Seri tipi", list(SERIES_METHODS), format_func=SERIES_METHODS.get)
+        else:
+            series_method = "ams"
+            st.caption(
+                "MGM uyumlu mod: AMS; 1, 2, 3, 4, 5, 6, 8, 12, 18 ve 24 saat; "
+                "LN2, LN3, Gama 2P, LP3 ve Gumbel arasından KS ve khi-kare ile otomatik seçim."
+            )
+        if analysis_method == "extended" and series_method == "pds":
             p1, p2 = st.columns(2)
             with p1:
                 pds_percentile = st.number_input("PDS eşik yüzdesi", 90.0, 99.9, DEFAULT_PDS_PERCENTILE, 0.5)
@@ -334,6 +360,7 @@ if calculate_clicked:
                 pds_percentile=float(pds_percentile),
                 pds_gap_hours=int(pds_gap_hours),
                 progress_callback=report_progress,
+                analysis_method=analysis_method,
             )
         except Exception as exc:
             st.session_state.analysis_result = None
@@ -349,11 +376,17 @@ with right:
         st.info("Konumu ve analiz dönemini seçip **Analizi hesapla** düğmesine basın.")
     else:
         st.subheader("3 · Sonuçlar")
+        if result.get("analysisMethod") == "mgm_compatible":
+            st.info(
+                "**MGM uyumlu hesap:** Open-Meteo ERA5 saatlik yeniden analiz verisi kullanılmıştır. "
+                "Bu sonuç resmî MGM istasyon IDF değeri değildir. Saatlik çözünürlük nedeniyle "
+                "5–30 dakikalık MGM süreleri hesaplanmamıştır."
+            )
         m1, m2, m3, m4 = st.columns(4)
         m1.metric("Veri dönemi", f"{result['startYear']}–{result['endYear']}")
         m2.metric("Kullanılan kayıt", f"{result['yearsUsed']} yıl")
         m3.metric("Tekerrür aralığı", f"{RETURN_PERIODS[0]}–{RETURN_PERIODS[-1]} yıl")
-        m4.metric("Seri tipi", result["seriesMethod"].upper())
+        m4.metric("Hesap yöntemi", result.get("analysisMethodLabel", result["seriesMethod"].upper()))
 
         level, message = quality_message(result)
         getattr(st, level)(message)
@@ -369,7 +402,10 @@ with right:
             st.dataframe(idf_df.round(3), use_container_width=True, hide_index=True)
 
         with tabs[2]:
-            st.caption("Daha düşük AIC ve yüksek uyum sırası, aday dağılımın göreli başarısını gösterir.")
+            if result.get("analysisMethod") == "mgm_compatible":
+                st.caption("Her süre için dağılım, KS ve khi-kare uygunluk sonuçlarına göre otomatik seçilmiştir.")
+            else:
+                st.caption("Daha düşük AIC ve yüksek uyum sırası, aday dağılımın göreli başarısını gösterir.")
             st.dataframe(diagnostics_df.round(4), use_container_width=True, hide_index=True)
 
         with tabs[3]:
